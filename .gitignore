@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+*.tgz
+.env
+.env.*
+!.env.example
+harness.local.json
+.harness/
+*.db
+*.db-shm
+*.db-wal

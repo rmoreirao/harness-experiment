@@ -1,0 +1,49 @@
+{
+  "name": "harness-experiment",
+  "version": "0.1.0",
+  "description": "A local, resumable, approval-first agent harness for Windows Terminal.",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.14.0 <23" },
+  "bin": { "harness": "./dist/cli.js" },
+  "exports": { ".": "./dist/index.js" },
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "README.md", "harness.example.json", ".env.example"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test",
+    "test": "vitest run",
+    "dev": "tsx src/cli.tsx",
+    "eval": "tsx test/evaluate.ts",
+    "verify:terminal": "tsx test/terminal-check.ts",
+    "verify:package": "tsx test/package-check.ts",
+    "verify:live": "tsx test/live-check.ts",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@openai/agents": "0.21.0",
+    "@types/better-sqlite3": "7.6.13",
+    "ajv": "8.17.1",
+    "better-sqlite3": "12.4.1",
+    "fs-native-extensions": "1.5.3",
+    "ink": "6.8.0",
+    "openai": "7.53.0",
+    "react": "19.3.1",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "@types/node": "22.19.15",
+    "@types/react": "19.3.0",
+    "@xterm/headless": "5.5.0",
+    "eslint": "9.39.1",
+    "ink-testing-library": "4.0.0",
+    "node-pty": "1.1.0",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.57.0",
+    "vitest": "4.0.18"
+  }
+}

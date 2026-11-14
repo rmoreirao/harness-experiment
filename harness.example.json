@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "mode": "openai",
+  "workspace": "D:\\documents",
+  "dataDir": "D:\\harness-data",
+  "baseURL": "https://api.openai.com/v1",
+  "model": "REPLACE_WITH_YOUR_MODEL",
+  "instructions": "Summarize approved documents accurately. Cite the source file paths. Ask before reading or saving.",
+  "mcp": [],
+  "limits": {
+    "maxIterations": 30,
+    "maxTokens": 50000,
+    "maxOutputTokens": 2048,
+    "contextTokens": 16000,
+    "activeTimeoutMs": 300000,
+    "modelTimeoutMs": 60000,
+    "toolTimeoutMs": 30000,
+    "maxConcurrency": 2,
+    "maxFileBytes": 262144,
+    "maxToolBytes": 262144
+  }
+}
