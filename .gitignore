@@ -6,6 +6,7 @@ coverage/
 .env.*
 !.env.example
 harness.local.json
+harness.v2.local.json
 .harness/
 *.db
 *.db-shm

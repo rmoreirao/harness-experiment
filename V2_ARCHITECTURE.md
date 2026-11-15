@@ -80,7 +80,7 @@ Bind decisions to runtime/product session, objective, action identity, arguments
 
 Keep approval-first as default; a read-only restriction and a trusted-read grant are distinct settings. Grants are explicit, bounded, and revocable. Do not inherit permanent permission files from personal sessions or share them between independent sessions accidentally.
 
-Repository instructions and retrieved content are data/context, not permission. Reviewed local skills may guide behavior but cannot authorize shell commands, enable tools, or install dependencies. Keep repository command hooks disabled unless explicitly admitted under a separate trust decision.
+Repository instructions and retrieved content are data/context, not permission. Bundled guidance and custom local skills may guide behavior but cannot authorize shell commands, enable tools, or install dependencies. Load workspace `.github\skills\<name>\SKILL.md` documents into an application-owned snapshot at startup; a configured workspace-relative directory may replace that default. `/skills list` exposes the catalog and idle-only `/skills reload` atomically refreshes it. Advertise the current catalog to each objective and retrieve relevant bodies through the controlled `workflow_skill` tool, not ambient SDK discovery. Keep repository command hooks disabled unless explicitly admitted under a separate trust decision.
 
 ## Workspace and Coding Execution
 
@@ -152,6 +152,6 @@ Redact configured secrets before local diagnostic export, sanitize terminal cont
 
 Preserve the original `MVP_*` specifications and existing data. Expose old session history through a read-only legacy view; do not deserialize OpenAI `RunState` with Copilot or migrate it by copying JSON fields.
 
-Start new objectives in V2 runtime sessions. Retain the original MVP launch path during development, and switch the default only after A01-A08 evidence is recorded. Do not ship two cooperating agent loops as a permanent migration mechanism.
+Start new objectives in V2 runtime sessions. Retain the original MVP launch path during development, and switch the default only after all required A01-A08 cases meet their expected outcomes with recorded evidence. Do not ship two cooperating agent loops as a permanent migration mechanism.
 
 Pin the published SDK, its compatible runtime artifacts, Node.js, and tool providers. Verify Windows package installation, native dependencies, runtime cleanup, credential exclusion, and historical data preservation. First implementation tasks prove integration details; concrete limitations are surfaced rather than becoming an indefinite separate approval phase.

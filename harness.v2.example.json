@@ -1,0 +1,36 @@
+{
+  "version": 2,
+  "workspace": ".",
+  "dataDir": "C:\\Users\\YOUR_USER\\AppData\\Local\\harness-experiment\\v2",
+  "model": {
+    "baseURL": "https://your-endpoint.example/v1",
+    "canonical": "your-canonical-model-identifier",
+    "wire": "your-deployment-identifier",
+    "wireAPI": "responses",
+    "contextTokens": 32000,
+    "outputTokens": 2048
+  },
+  "readOnly": false,
+  "skillsDirectory": ".github\\skills",
+  "network": {
+    "origins": [],
+    "localFixtureOrigins": [],
+    "maxBytes": 5242880,
+    "timeoutMs": 15000,
+    "redirects": 3
+  },
+  "limits": {
+    "maxTokens": 100000,
+    "maxRequests": 100,
+    "maxActions": 100,
+    "maxReplans": 2,
+    "timeoutMs": 600000,
+    "toolTimeoutMs": 30000,
+    "concurrency": 2,
+    "maxFileBytes": 1048576,
+    "maxOutputBytes": 1048576,
+    "maxResultBytes": 20971520,
+    "maxWorkspaceBytes": 52428800,
+    "maxFiles": 5000
+  }
+}

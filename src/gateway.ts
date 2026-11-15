@@ -8,6 +8,7 @@ import { type Config, hash } from './config.js';
 import { HarnessError, type RunContextData, type AppEvent, type Task, type Invocation, record, errorText } from './contracts.js';
 import { FileTools } from './files.js';
 import { Store } from './storage.js';
+import { errorDiagnostic } from './errors.js';
 
 export interface ToolDefinition {
   name: string;
@@ -192,7 +193,8 @@ export class Gateway {
       const knownFileError = record(error) && ['EEXIST', 'ENOENT'].includes(String(error.code));
       const status = (def.effect === 'external' || def.effect === 'write') && !knownPrecondition && !knownFileError ? 'unknown' : 'failed';
       this.store.putInvocation({ ...invocation, status, error: this.store.redactor.text(errorText(error)) });
-      await this.emit({ type: 'error', data: { tool: name, status, message: errorText(error) } });
+      await this.emit({ type: 'error', data: errorDiagnostic(error, this.store.redactor,
+        { source: 'tool', tool: name, invocationId: id, status }) });
       throw error;
     } finally { clearTimeout(timeout); parent.removeEventListener('abort', abort); }
   }

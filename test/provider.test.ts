@@ -53,7 +53,7 @@ it('uses the real OpenAI Responses client for streaming tool calls, checkpoint r
 });
 it('does not silently retry authentication failures or treat them as successful output', async () => {
   const restore = credentials();
-  const endpoint = await provider(res => { res.writeHead(401, { 'Content-Type': 'application/json' }).end(JSON.stringify({
+  const endpoint = await provider(res => { res.writeHead(401, { 'Content-Type': 'application/json', 'x-request-id': 'synthetic-auth-request' }).end(JSON.stringify({
     error: { message: 'Synthetic authentication failure', type: 'authentication_error' },
   })); });
   const f = fixture(); cleanup.push(f.cleanup);
@@ -64,6 +64,10 @@ it('does not silently retry authentication failures or treat them as successful 
     expect(run.reason).toContain('401');
     expect(endpoint.requests).toHaveLength(1);
     expect(run.finalOutput).toBeNull();
+    expect(app.store.errors(app.id).errors[0]).toMatchObject({
+      source: 'model', httpStatus: 401, providerRequestId: 'synthetic-auth-request', runId: run.id,
+    });
+    expect(app.store.errors(app.id).errors[0]?.stack).toContain('makeRequest');
   } finally { await app.close(); await endpoint.close(); restore(); }
 });
 it('fails closed when the provider omits token accounting', async () => {

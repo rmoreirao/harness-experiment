@@ -4,12 +4,14 @@ import { SessionController } from './controller.js';
 import { errorText, type PendingRequest } from './contracts.js';
 import { edit, emptyEditor, InputDecoder, type InputAction } from './editor.js';
 import { terminalText } from './privacy.js';
+import { errorDiagnostic, errorInspector, errorNotice } from './errors.js';
 
 export const HELP = [
   '/help  /status  /exit  /cancel  /continue',
   '/approve or /reject: decide the displayed action',
   '/request: inspect the complete pending action; /back: return to conversation',
   '/inspect <invocation ID>: inspect recorded tool output',
+  '/errors [BEFORE_ID]: list session errors; /error ERROR_ID: inspect one error',
   '/reconcile {"note":"effects checked","input":0,"output":0}: resolve interrupted work',
   'Enter submits. Ctrl+J or Alt+Enter inserts a newline. Bracketed paste never submits.',
   'Arrows edit/history. PageUp/PageDown scroll. Ctrl+C cancels/clears. Ctrl+D saves and exits.',
@@ -30,10 +32,21 @@ export function TerminalApp({ controller }: { controller: SessionController }) {
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(busy); busyRef.current = busy;
   const commandRef = useRef<(text: string) => Promise<void>>(async () => {});
-  const run = async (operation: () => Promise<unknown>) => {
+  const reportError = (error: unknown, operation: string) => {
+    const data = errorDiagnostic(error, controller.store.redactor, { source: 'command', operation });
+    try {
+      const event = controller.store.event({
+        type: 'error', sessionId: controller.id, runId: controller.inspect().run?.id ?? null, data,
+      });
+      setNotice(errorNotice(event.data));
+    } catch (storageError) {
+      setNotice(`${data.message}\nError history could not be saved: ${controller.store.redactor.text(errorText(storageError))}`);
+    }
+  };
+  const run = async (operation: () => Promise<unknown>, name: string) => {
     setBusy(true); busyRef.current = true;
     try { await operation(); }
-    catch (error) { setNotice(controller.store.redactor.text(errorText(error))); }
+    catch (error) { reportError(error, name); }
     finally { setBusy(false); busyRef.current = false; setRevision(r => r + 1); }
   };
   commandRef.current = async text => {
@@ -43,6 +56,8 @@ export function TerminalApp({ controller }: { controller: SessionController }) {
     if (text === '/cancel') { controller.cancel(); setNotice('Cancellation requested.'); setRevision(r => r + 1); return; }
     if (text === '/help') { setInspector(HELP); setOffset(0); return; }
     if (text === '/status') { setInspector(JSON.stringify(current, null, 2)); setOffset(0); return; }
+    const errors = errorInspector(text, controller.store, controller.id);
+    if (errors !== null) { setInspector(errors); setOffset(0); return; }
     if (text === '/back') { setInspector(null); setOffset(0); return; }
     if (text === '/request') {
       if (!pending) throw new Error('There is no pending action.');
@@ -57,19 +72,19 @@ export function TerminalApp({ controller }: { controller: SessionController }) {
       const value: unknown = JSON.parse(text.slice(11));
       const { z } = await import('zod');
       const result = z.object({ note: z.string().min(1), input: z.number().int().nonnegative().optional(), output: z.number().int().nonnegative().optional() }).parse(value);
-      await run(() => controller.reconcile(result.note, result.input !== undefined && result.output !== undefined ? { input: result.input, output: result.output } : undefined));
+      await run(() => controller.reconcile(result.note, result.input !== undefined && result.output !== undefined ? { input: result.input, output: result.output } : undefined), '/reconcile');
       return;
     }
     if (busyRef.current) { setNotice('Work is running. Use Ctrl+C to interrupt before sending another request.'); return; }
-    if (text === '/continue') { await run(() => controller.continueRun()); return; }
+    if (text === '/continue') { await run(() => controller.continueRun(), '/continue'); return; }
     if (text === '/approve' || text === '/reject') {
       if (!pending || pending.kind !== 'approval') throw new Error('There is no pending tool approval.');
       setInspector(null); setOffset(0);
-      await run(() => controller.respond(pending.id, pending.revision, text === '/approve' ? 'approve' : 'reject')); return;
+      await run(() => controller.respond(pending.id, pending.revision, text === '/approve' ? 'approve' : 'reject'), text); return;
     }
     if (text.startsWith('/')) throw new Error('Unknown command. Type /help.');
-    if (pending?.kind === 'question') { await run(() => controller.respond(pending.id, pending.revision, { answer: text })); return; }
-    await run(() => controller.submit(text));
+    if (pending?.kind === 'question') { await run(() => controller.respond(pending.id, pending.revision, { answer: text }), 'answer question'); return; }
+    await run(() => controller.submit(text), 'submit');
   };
   useEffect(() => controller.subscribe(event => {
     if (event.type === 'text') setLive(t => t + String(event.data.delta ?? ''));
@@ -77,7 +92,7 @@ export function TerminalApp({ controller }: { controller: SessionController }) {
     if (event.type === 'request' || event.type === 'tool' || event.type === 'usage') setRevision(r => r + 1);
     if (event.type === 'tool') setNotice(`Tool ${String(event.data.tool)}: ${String(event.data.status)}${event.data.id ? ` [${String(event.data.id)}]` : ''}`);
     if (event.type === 'compaction') setNotice('Working context compacted. Full transcript and tool results are retained.');
-    if (event.type === 'error') setNotice(String(event.data.message ?? 'Operation failed.'));
+    if (event.type === 'error') setNotice(errorNotice(event.data));
   }), [controller]);
   useEffect(() => {
     const decoder = new InputDecoder();
@@ -93,7 +108,7 @@ export function TerminalApp({ controller }: { controller: SessionController }) {
         }
         setRevision(r => r + 1); return;
       }
-      if (action.type === 'exit') { void commandRef.current('/exit').catch(e => setNotice(errorText(e))); return; }
+      if (action.type === 'exit') { void commandRef.current('/exit').catch(e => reportError(e, '/exit')); return; }
       if (action.type === 'redraw') { setRevision(r => r + 1); return; }
       if (action.type === 'submit') {
         const text = editorRef.current.text;
@@ -101,7 +116,7 @@ export function TerminalApp({ controller }: { controller: SessionController }) {
         setEditor(s => emptyEditor([...s.history, text]));
         editorRef.current = emptyEditor([...editorRef.current.history, text]);
         setOffset(0);
-        void commandRef.current(text).catch(e => setNotice(controller.store.redactor.text(errorText(e))));
+        void commandRef.current(text).catch(e => reportError(e, text.startsWith('/') ? text.split(/\s+/)[0]! : 'submit'));
         return;
       }
       const next = edit(editorRef.current, action);

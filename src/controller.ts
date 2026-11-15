@@ -7,6 +7,7 @@ import {
   type Model, type CallModelInputFilter, type SerializedTool,
 } from '@openai/agents';
 import { configHash, hash, type Config } from './config.js';
+import { errorDiagnostic } from './errors.js';
 import {
   HarnessError, errorText, record, usageSchema,
   type AppEvent, type LifecycleHook, type PendingRequest,
@@ -159,8 +160,8 @@ export class SessionController {
   }
   private async emit(event: Omit<AppEvent, 'sessionId' | 'runId'>): Promise<void> {
     const normalized = this.store.redactor.value(event.data);
-    const full: AppEvent = { ...event, data: record(normalized) ? normalized : {}, sessionId: this.id, runId: this.currentRunId };
-    if (event.type !== 'text') this.store.event(full);
+    let full: AppEvent = { ...event, data: record(normalized) ? normalized : {}, sessionId: this.id, runId: this.currentRunId };
+    if (event.type !== 'text') full = this.store.event(full);
     for (const listener of this.listeners) listener(full);
     for (const hook of this.options.hooks ?? []) await hook(full);
   }
@@ -348,7 +349,11 @@ export class SessionController {
         }
       }
       this.store.putRun(run);
-      await this.emit({ type: 'error', data: { message: run.reason, status: run.status } });
+      await this.emit({ type: 'error', data: {
+        ...errorDiagnostic(this.aborter.signal.aborted ? this.aborter.signal.reason : error, this.store.redactor,
+          { operation: 'agent run', model: this.config.model, status: run.status }),
+        message: run.reason,
+      } });
     } finally {
       clearTimeout(timeout);
       run = { ...this.store.run(id), ...run, activeMs: this.store.run(id).activeMs + Date.now() - start, updatedAt: Date.now() };

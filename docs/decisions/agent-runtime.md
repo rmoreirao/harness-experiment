@@ -1,7 +1,7 @@
 # Agent Runtime for V2
 
 Date: 2026-11-14.
-Status: accepted V2 design direction; integration has not been implemented.
+Status: accepted V2 design direction; opt-in integration implemented, full release acceptance pending.
 
 ## Decision
 

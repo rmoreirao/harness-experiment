@@ -10,6 +10,7 @@ import {
   type RunRecord, type Task, type TranscriptEntry,
 } from './contracts.js';
 import { Redactor } from './privacy.js';
+import { errorId, errorPage, errorSequence, storedError, type ErrorPage, type ErrorRecord, type ErrorRow } from './errors.js';
 
 interface DataRow { data: string }
 export class Store {
@@ -89,12 +90,28 @@ export class Store {
       'SELECT id,run_id AS runId,role,text FROM (SELECT * FROM transcript WHERE session_id=? ORDER BY id DESC LIMIT ?) ORDER BY id')
       .all(sessionId, limit);
   }
-  event(event: AppEvent): void {
+  event(event: AppEvent): AppEvent {
     const traceId = event.runId?.replaceAll('-', '') ?? hash(event.sessionId).slice(0, 32);
     const spanId = hash(`${event.runId}:${String(event.data.id ?? event.type)}`).slice(0, 16);
-    this.db.prepare('INSERT INTO events(session_id,run_id,type,at,data) VALUES (?,?,?,?,?)')
+    const data = this.redactor.value({ traceId, spanId, ...event.data }) as Record<string, unknown>;
+    const inserted = this.db.prepare('INSERT INTO events(session_id,run_id,type,at,data) VALUES (?,?,?,?,?)')
       .run(event.sessionId, event.runId, event.type, Date.now(),
-        JSON.stringify(this.redactor.value({ traceId, spanId, ...event.data })));
+        JSON.stringify(data));
+    return { ...event, data: event.type === 'error' ? { ...data, errorId: errorId(Number(inserted.lastInsertRowid)) } : data };
+  }
+  errors(sessionId: string, before?: string): ErrorPage {
+    const rows = this.db.prepare<[string, number], ErrorRow>(
+      `SELECT seq AS sequence,at,session_id AS sessionId,run_id AS runId,NULL AS objectiveId,data
+       FROM events WHERE session_id=? AND type='error' AND seq<? ORDER BY seq DESC LIMIT 21`)
+      .all(sessionId, before === undefined ? Number.MAX_SAFE_INTEGER : errorSequence(before));
+    return errorPage(rows, this.redactor);
+  }
+  error(sessionId: string, id: string): ErrorRecord {
+    const row = this.db.prepare<[string, number], ErrorRow>(
+      `SELECT seq AS sequence,at,session_id AS sessionId,run_id AS runId,NULL AS objectiveId,data
+       FROM events WHERE session_id=? AND type='error' AND seq=?`).get(sessionId, errorSequence(id));
+    if (!row) throw new HarnessError('ERROR_NOT_FOUND', 'No recorded error with that ID belongs to this session.');
+    return storedError(row, this.redactor);
   }
   trace(runId: string): { sequence: number; type: string; at: number; data: unknown }[] {
     return this.db.prepare<[string], { sequence: number; type: string; at: number; data: string }>(

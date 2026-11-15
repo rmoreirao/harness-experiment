@@ -101,4 +101,4 @@ Reviewed skills, bounded parallel tool work, and persistent task evidence are in
 
 ## Release Meaning
 
-V2 is implemented when all mandatory requirements have code and evidence, not when a generic chat or one file edit works. All A01-A08 scenarios must have recorded outcomes. Missing credentials, unsupported environments, failed checks, and manual-only observations remain explicit; they are not replaced with assumptions.
+V2 is implemented when all mandatory requirements have code and evidence, not when a generic chat or one file edit works. All required positive and negative cases in A01-A08 must meet their expected outcomes with recorded evidence. Missing credentials, unsupported environments, failed/skipped checks, and unobserved manual cases do not count as passing acceptance and must not be replaced with assumptions.

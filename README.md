@@ -4,6 +4,18 @@ A local, approval-first agent harness for **Windows Terminal + PowerShell**.
 TypeScript/Node.js, React/Ink, OpenAI Agents SDK, and SQLite. One resumable session
 per terminal process; different terminals can run independent sessions.
 
+An **opt-in V2 preview** now uses the pinned Copilot SDK/runtime for broader
+coding, research and isolated browser workflows. Configure `harness.v2.local.json`
+and run `npm run dev:v2 -- --config .\harness.v2.local.json`; see
+[V2 setup, API and limitations](docs/V2.md).
+The MVP command and historical data remain unchanged. V2 is not release-accepted
+and is not the default.
+V2 loads workspace skills from `.github\skills\<name>\SKILL.md` at startup;
+use `/skills list` and `/skills reload` to inspect and refresh the loaded set.
+In V2, `/approve_all` approves every pending and future tool call for the session,
+including after resume; `/approve_all off` restores per-call approvals.
+Questions and capability/safety restrictions remain in force.
+
 The offline reference workflow and regression suite use a deterministic fake
 model through the real Agents SDK. Fake output is prominently labeled and is
 not evidence of language-model quality. The real OpenAI HTTP/SSE client also
@@ -139,6 +151,7 @@ isolated; overlapping active workspaces generate a warning.
 | `/request`, `/back` | Inspect the entire pending request; return to conversation |
 | `/approve`, `/reject` | Decide the displayed current tool call only |
 | `/inspect INVOCATION_ID` | Inspect its stored result |
+| `/errors [BEFORE_ID]`, `/error ERROR_ID` | List session errors, page through older errors, or inspect one error |
 | `/continue` | Continue a compatible persisted SDK checkpoint |
 | `/cancel` | Cancel without discarding the conversation |
 
@@ -244,6 +257,18 @@ SDK external tracing is disabled/replaced. Local lifecycle events contain
 session/run correlation and trace/span identifiers. Known credentials and
 terminal control sequences are removed from diagnostic output. Arbitrary
 personal-data recognition is not promised.
+
+Errors display a stable ID such as `error-12`. Use `/errors` for the latest 20
+errors in this session, `/error error-12` for its diagnostic details, and the
+displayed `/errors BEFORE_ID` command for older entries. History survives resume
+and includes earlier runs; inspecting it never retries an action. Details include
+the recorded timestamp, run/tool identities, error code, HTTP status and provider
+request ID when available, plus bounded, redacted stack/cause information for new
+errors. Historical errors retain whatever details were originally recorded.
+Diagnostics do not add request bodies, prompts, tool arguments, or response
+bodies. Error messages themselves may still contain sensitive document data;
+review them before sharing. Commands report explicitly if an error cannot be
+saved. This session inspector does not capture failures before a session opens.
 
 ## Resource semantics
 

@@ -23,6 +23,11 @@ try {
   }
   const version = execFileSync(process.execPath, [path.join(directory, 'dist', 'cli.js'), '--version'], { encoding: 'utf8' });
   if (!version.includes('0.1.0')) throw new Error('Installed CLI version check failed.');
+  const v2Version = execFileSync(process.execPath, [path.join(directory, 'dist', 'v2', 'cli.js'), '--version'], { encoding: 'utf8' });
+  if (!v2Version.includes('runtime 1.0.112') || !existsSync(path.join(directory, 'harness.v2.example.json')) ||
+      !existsSync(path.join(directory, 'docs', 'V2.md')) || existsSync(path.join(directory, 'harness.v2.local.json'))) {
+    throw new Error('V2 CLI/runtime pin, configuration, documentation or private-file exclusion failed.');
+  }
   const workspace = path.join(root, 'documents'); mkdirSync(workspace);
   writeFileSync(path.join(workspace, 'notes.md'), 'Synthetic package acceptance document.');
   // The installed native DLLs must unload before Windows can remove the test installation.
@@ -46,5 +51,39 @@ try {
     pathToFileURL(path.join(directory, 'dist', 'index.js')).href,
     JSON.stringify({ mode: 'fake', workspace, dataDir: path.join(root, 'state') })],
   { encoding: 'utf8', env, timeout: 30000, stdio: 'pipe' });
-  console.log('PASS isolated npm install: packaged CLI, native SQLite/locks, exported API, approval restart, and approved file output.');
+  const v2Script = `
+    const {V2Controller,parseV2Config}=await import(process.argv[1]);
+    const {createServer}=await import('node:http');
+    let calls=0;
+    const server=createServer(async(req,res)=>{
+      for await(const chunk of req){void chunk;}
+      if(req.headers.authorization!=='Bearer synthetic-installed-package-key'){res.writeHead(401).end();return;}
+      calls++;
+      const output=[{id:'installed_msg',type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:'Installed Copilot runtime verified.',annotations:[]}]}];
+      const event=(type,value)=>res.write('event: '+type+'\\ndata: '+JSON.stringify({type,...value})+'\\n\\n');
+      res.writeHead(200,{'Content-Type':'text/event-stream'});
+      event('response.created',{response:{id:'installed_response',object:'response',status:'in_progress',output:[]}});
+      event('response.output_item.added',{output_index:0,item:output[0]});
+      event('response.content_part.added',{item_id:'installed_msg',output_index:0,content_index:0,part:{type:'output_text',text:'',annotations:[]}});
+      event('response.output_text.delta',{item_id:'installed_msg',output_index:0,content_index:0,delta:'Installed Copilot runtime verified.'});
+      event('response.output_item.done',{output_index:0,item:output[0]});
+      event('response.completed',{response:{id:'installed_response',object:'response',status:'completed',model:'synthetic-deployment',output,usage:{input_tokens:10,output_tokens:5,total_tokens:15}}});
+      res.end();
+    });
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    const base=JSON.parse(process.argv[2]);
+    const config=parseV2Config({...base,model:{baseURL:'http://127.0.0.1:'+server.address().port+'/v1',canonical:'gpt-6.1-sol',wire:'synthetic-deployment'}});
+    const app=await V2Controller.open({config,apiKey:'synthetic-installed-package-key'});
+    try{
+      const result=await app.submit('Synthetic installed package verification.');
+      if(result.status!=='completed'||result.usage.input!==10||calls!==1)throw new Error(JSON.stringify(result));
+    }finally{
+      await app.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
+    }
+  `;
+  execFileSync(process.execPath, ['--input-type=module', '-e', v2Script,
+    pathToFileURL(path.join(directory, 'dist', 'v2', 'index.js')).href,
+    JSON.stringify({ version: 2, workspace, dataDir: path.join(root, 'v2-state') })],
+  { encoding: 'utf8', env, timeout: 30000, stdio: 'pipe' });
+  console.log('PASS clean npm install: MVP approval/restart/output, V2 CLI/API/docs, bundled real Copilot runtime with synthetic BYOK/usage, SQLite/locks and private-file exclusion.');
 } finally { rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }
