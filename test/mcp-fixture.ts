@@ -1,16 +1,13 @@
 import { createServer, type Server } from 'node:http';
-import { appendFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { setTimeout as delay } from 'node:timers/promises';
 
-function makeServer(counter?: string): McpServer {
+function makeServer(): McpServer {
   const server = new McpServer({ name: 'synthetic-fixture', version: '1.0.0' });
   server.registerTool('echo', { description: 'Echo synthetic fixture input', inputSchema: { text: z.string() } },
     async ({ text }) => {
-      if (counter) appendFileSync(counter, 'called\n');
       return { content: [{ type: 'text', text }], structuredContent: { text, providerKeyInherited: Boolean(process.env.OPENAI_API_KEY) } };
     });
   server.registerTool('slow', { description: 'Synthetic long-running operation', inputSchema: { text: z.string() } },
@@ -41,7 +38,4 @@ export async function httpFixture(): Promise<{ server: Server; url: string; call
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('No fixture port');
   return { server, url: `http://127.0.0.1:${address.port}/mcp`, calls: () => calls };
-}
-if (process.argv.includes('--stdio')) {
-  await makeServer(process.argv[process.argv.indexOf('--stdio') + 1]).connect(new StdioServerTransport());
 }

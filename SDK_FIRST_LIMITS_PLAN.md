@@ -7,6 +7,11 @@ run also passed: 42,730 reported tokens, eight requests, four supported headline
 records and one verified report. Product policy remained uncapped; the run used
 separately labeled verifier-only ceilings.
 
+This is the historical SDK-first change record, predating consolidation into the
+sole implementation. Source paths and commands below use the promoted names;
+the original mixed-runtime test totals/package observations are historical,
+not results of a new consolidation or paid verification run.
+
 ## Outcome
 
 For new sessions, remove the mandatory 100,000-token objective cap and the
@@ -63,7 +68,7 @@ rejections must identify the mismatch without inventing a larger limit.
 
 ### 1. Version the new configuration and preserve old sessions
 
-Files: `src\v2\config.ts`, `src\v2\store.ts`, examples and configuration tests.
+Files: `src\config.ts`, `src\store.ts`, examples and configuration tests.
 
 - Introduce configuration version 3 for new launches. Omitted
   `model.contextTokens`, `model.outputTokens`, `limits.maxTokens` and
@@ -79,7 +84,7 @@ Files: `src\v2\config.ts`, `src\v2\store.ts`, examples and configuration tests.
 - Upgrade the user's launch-file version deliberately, preserving network,
   skills, endpoints and other explicit settings. Do not read or print secrets
   into the plan or configuration.
-- Keep product/data namespace V2. A configuration-version change alone does not
+- Keep the existing product/data namespace. A configuration-version change alone does not
   require a new SQLite schema or rewriting runtime journals. Add a database
   migration only if an actual SQL representation changes.
 - Preserve public exports and make all schema-default/call-site changes
@@ -88,15 +93,15 @@ Files: `src\v2\config.ts`, `src\v2\store.ts`, examples and configuration tests.
 
 ### 2. Delegate context/output behavior to the SDK
 
-Files: `src\v2\runtime.ts`, runtime contracts and SDK/protocol fixtures.
+Files: `src\runtime.ts`, runtime contracts and SDK/protocol fixtures.
 
 - Supply `maxPromptTokens` / `maxOutputTokens` only when numeric overrides were
   deliberately configured. Remove unconditional rewriting of
   `data.max_output_tokens` in the host transport.
 - Keep the explicit canonical identity, wire identity, fixed upstream,
   BYOK-only authentication, tool filters, private namespace and telemetry policy.
-- Keep `infiniteSessions` and SDK-owned compaction. Do not copy the MVP history
-  compactor into V2 or edit the runtime's raw conversation items.
+- Keep `infiniteSessions` and SDK-owned compaction. Do not introduce a second
+  history compactor or edit the runtime's raw conversation items.
 - Project supported SDK context/usage events and cached metadata into normalized
   application events. Keep per-call context, per-response output allowance and
   cumulative objective usage separate.
@@ -109,7 +114,7 @@ Files: `src\v2\runtime.ts`, runtime contracts and SDK/protocol fixtures.
 
 ### 3. Separate request accounting from optional budget admission
 
-Files: `src\v2\resources.ts`, `runtime.ts`, `contracts.ts`, `controller.ts`,
+Files: `src\resources.ts`, `runtime.ts`, `contracts.ts`, `controller.ts`,
 `research.ts` and accounting tests.
 
 - Replace the always-required reservation path with request start/outcome
@@ -140,8 +145,8 @@ Files: `src\v2\resources.ts`, `runtime.ts`, `contracts.ts`, `controller.ts`,
 
 ### 4. Update terminal/headless presentation and documentation
 
-Files: `src\v2\ui.tsx`, `cli.tsx`, API contracts, `docs\V2.md`,
-`harness.v2.example.json` and focused UI/headless tests.
+Files: `src\ui.tsx`, `cli.tsx`, API contracts, `docs\GUIDE.md`,
+`harness.example.json` and focused UI/headless tests.
 
 - Show cumulative usage with "no task token budget" when uncapped, not
   `used/100000`, `used/undefined` or `used/Infinity`.
@@ -154,11 +159,11 @@ Files: `src\v2\ui.tsx`, `cli.tsx`, API contracts, `docs\V2.md`,
 
 ### 5. Migrate the acceptance harness, then validate the exact goal
 
-Files: `test\v2\news-live-check.ts`, its authority tests, resource/runtime/research
+Files: `test\news-live-check.ts`, its authority tests, resource/runtime/research
 tests, package tests and directly related documentation.
 
 - Separate an operator's verification ceiling from product `limits.maxTokens`.
-  The current verifier writes a 100,000 token value into the legacy configuration;
+  The previous verifier wrote a 100,000 token value into product configuration;
   that must not become evidence that the new default is uncapped.
 - Default tests use synthetic endpoints and deterministic current-news fixtures.
   No paid calls occur without an explicit validation authorization and ceiling.
@@ -167,7 +172,7 @@ tests, package tests and directly related documentation.
   Do not claim a bounded verifier proves unrestricted output behavior.
 - Build and typecheck, run focused regression/negative cases, then the full suite
   with installed-provider cases enabled where applicable. Verify clean package
-  installation, legacy history/config preservation and owned-process cleanup.
+  installation, saved-session/config preservation and owned-process cleanup.
 
 ## Required regression matrix
 
@@ -249,8 +254,8 @@ and integrity checks remain intact. No historical session was rewritten.
 | Optional policies | Token/currency denials occur before provider dispatch; missing finite SDK output bounds fail explicitly rather than inventing a default. Verification ceilings are separate from product policy. | Positive and negative fixtures; no implicit spending policy restored. |
 | Missing billing/recovery | Uncapped answers retain unknown usage/null cost without failing solely for billing uncertainty. Pending models, unknown external effects and actual model failures remain blocking. Search charges and unknown tool prices survive reconciliation. | Real SDK missing-usage fixtures plus durable recovery and tool-charge tests. |
 | Compaction and cold resume | Native background summarization settles before product stop validation; the SDK applies its summary on a later turn. Original objective records and counters survive application and cold resume. Cancellation releases the request ledger and concurrency slot. | Synthetic reported context pressure against the real SDK; not production-load/provider stress coverage. |
-| Windows terminal | `npm run verify:v2:terminal` passed in PowerShell/ConPTY, including uncapped display, independent terminals, interrupted approvals, cold resume and owned shutdown. | Real native terminal; physical clipboard/font checks remain manual. |
-| Clean package | Packed installation passed `npm run verify:package`: MVP continuity, V2 CLI/API/docs, version-3 uncapped defaults and unchanged SDK output omission, native SQLite/locks and private-file exclusion. | Clean temporary npm installation; no registry publication. |
+| Windows terminal | `npm run verify:terminal` passed in PowerShell/ConPTY, including uncapped display, independent terminals, interrupted approvals, cold resume and owned shutdown. | Real native terminal; physical clipboard/font checks remain manual. |
+| Clean package (before consolidation) | Packed installation passed the then-current `verify:package`: both historical entry points, version-3 uncapped defaults and unchanged SDK output omission, native SQLite/locks and private-file exclusion. | Historical clean temporary npm installation; no registry publication. |
 | Fresh paid Globo run | **Passed:** `gpt-6-luna`, eight completed requests, **42,730 reported tokens** (41,491 input / 1,239 output), four supported headline records, one verified report and completed plan. | Fresh user authorization; current `https://www.globo.com/` evidence retrieved at **2026-11-16T11:38:24.076Z**. Independent verifier ceilings: 100,000 total tokens / 2,048 output tokens per call; product token/currency budgets and prompt/output overrides remained absent. |
 | Live redirect and cleanup | The initial cross-origin redirect was explicitly refused, then the destination was separately approved and retrieved. No citation, model or quota-refusal failures occurred; zero pending requests/decisions and owned cleanup completed. | One expected `REDIRECT` diagnostic, not silent cross-origin access. No retry of the paid acceptance run was needed. |
 
@@ -278,6 +283,6 @@ changing the user's product configuration or historical sessions.
 
 Automatic output-field omission is verified on the synthetic wire, not with
 unrestricted paid output. Production-load compaction, exhaustive failure
-injection and unrelated V2 release gates are not declared complete.
+injection and unrelated product release gates are not declared complete.
 No SDK upgrade, new model framework, model/provider fallback, workspace shell
-fallback, or unrelated V2 release work is part of this change.
+fallback, or unrelated product release work was part of this change.

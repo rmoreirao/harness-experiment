@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from 'vitest';
-import { Store, SqliteSession } from '../src/storage.js';
+import { Store } from '../src/store.js';
 import { Ownership } from '../src/ownership.js';
 import { fixture, worker } from './helpers.js';
 import { errorDiagnostic, errorInspector } from '../src/errors.js';
@@ -7,24 +7,6 @@ import { Redactor } from '../src/privacy.js';
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
-it('atomically deduplicates history operations and rejects changed IDs and stale suffixes', async () => {
-  const f = fixture(); cleanup.push(f.cleanup);
-  const store = new Store(f.config.dataDir);
-  try {
-    const session = new SqliteSession(store, store.createSession(f.config));
-    const a = { type: 'message' as const, role: 'user' as const, content: 'hello' };
-    const op = { operationId: 'one', transaction: { type: 'append_items' as const, items: [a] } };
-    await session.applyHistoryTransaction(op);
-    await session.applyHistoryTransaction(op);
-    expect(await session.getItems()).toEqual([a]);
-    await expect(session.applyHistoryTransaction({ ...op, transaction: { type: 'append_items', items: [{ ...a, content: 'different' }] } })).rejects.toThrow('different content');
-    await expect(session.applyHistoryTransaction({ operationId: 'two', transaction: { type: 'replace_suffix', expectedSuffix: [{ ...a, content: 'stale' }], replacement: [] } })).rejects.toThrow('History changed');
-    expect(await session.getItems()).toEqual([a]);
-    await session.applyHistoryTransaction({ operationId: 'two', transaction: { type: 'replace_suffix', expectedSuffix: [a], replacement: [{ ...a, content: 'replacement' }] } });
-    expect((await session.getItems())[0]).toMatchObject({ content: 'replacement' });
-  } finally { store.close(); }
-});
-
 it('uses an OS lock across real processes and releases it after owner termination', async () => {
   const f = fixture(); cleanup.push(f.cleanup);
   const { child } = await worker(['lock', f.config.dataDir, 'session-one']);
@@ -40,8 +22,8 @@ it('uses an OS lock across real processes and releases it after owner terminatio
 it('rejects a newer database schema rather than downgrading it', () => {
   const f = fixture(); cleanup.push(f.cleanup);
   const store = new Store(f.config.dataDir);
-  store.db.pragma('user_version = 2'); store.close();
-  expect(() => new Store(f.config.dataDir)).toThrow('newer');
+  store.db.pragma('user_version = 3'); store.close();
+  expect(() => new Store(f.config.dataDir)).toThrow('Unsupported schema');
 });
 it('preserves redacted structured errors across reopen and restricts inspection to the owning session', () => {
   const f = fixture(); cleanup.push(f.cleanup);
@@ -49,25 +31,25 @@ it('preserves redacted structured errors across reopen and restricts inspection 
   const redactor = new Redactor([secret]);
   let store = new Store(f.config.dataDir, redactor);
   try {
-    const sessionId = store.createSession(f.config);
-    const peerId = store.createSession(f.config);
+    const sessionId = store.createSession(f.config).id;
+    const peerId = store.createSession(f.config).id;
     const cause = new Error(`Provider cause ${secret}\u001b[31m`);
     const failure = Object.assign(new Error(`Provider rejected ${secret}`, { cause }), {
       code: 'authentication_error', status: 401, requestID: 'provider-request-one',
       request: { body: 'PRIVATE_REQUEST_BODY' }, response: { body: 'PRIVATE_RESPONSE_BODY' },
     });
-    const event = store.event({ type: 'error', sessionId, runId: 'earlier-run',
+    const event = store.event({ type: 'error', sessionId, objectiveId: 'earlier-objective',
       data: errorDiagnostic(failure, redactor, { operation: 'Responses request' }) });
     const id = String(event.data.errorId);
     store.close(); store = new Store(f.config.dataDir, redactor);
     expect(store.error(sessionId, id)).toMatchObject({
-      id, runId: 'earlier-run', source: 'model', code: 'authentication_error',
+      id, objectiveId: 'earlier-objective', source: 'model', code: 'authentication_error',
       httpStatus: 401, providerRequestId: 'provider-request-one',
       message: 'Provider rejected [REDACTED]', cause: { message: 'Provider cause [REDACTED]' },
     });
     expect(store.error(sessionId, id).at).toBeGreaterThan(0);
     expect(store.error(sessionId, id).stack).toContain('[REDACTED]');
-    const stored = JSON.stringify(store.trace('earlier-run'));
+    const stored = JSON.stringify(store.events(sessionId));
     expect(stored).not.toContain(secret);
     expect(stored).not.toContain('\\u001b');
     expect(stored).not.toContain('PRIVATE_REQUEST_BODY');
@@ -84,10 +66,10 @@ it('pages older errors without including other event types and retains legacy me
   const f = fixture(); cleanup.push(f.cleanup);
   const store = new Store(f.config.dataDir);
   try {
-    const sessionId = store.createSession(f.config);
+    const sessionId = store.createSession(f.config).id;
     for (let index = 0; index < 22; index++) {
-      store.event({ type: 'state', sessionId, runId: null, data: { message: 'Not an error.' } });
-      store.event({ type: 'error', sessionId, runId: null, data: { message: `Legacy failure ${index}` } });
+      store.event({ type: 'state', sessionId, objectiveId: null, data: { message: 'Not an error.' } });
+      store.event({ type: 'error', sessionId, objectiveId: null, data: { message: `Legacy failure ${index}` } });
     }
     const page = store.errors(sessionId);
     expect(page.errors).toHaveLength(20);
@@ -107,5 +89,38 @@ it('pages older errors without including other event types and retains legacy me
     const bounded = errorDiagnostic(new Error(`${'x'.repeat(2040)}${secret}`), new Redactor([secret]));
     expect(bounded.message).not.toContain('synthetic-');
     expect(bounded.message).toContain('[truncated]');
+  } finally { store.close(); }
+});
+it('retains event timestamps and pages stable objective-scoped calls without replaying or leaking records', () => {
+  const f = fixture(); cleanup.push(f.cleanup);
+  let store = new Store(f.config.dataDir, new Redactor(['fixture-trace-key']));
+  try {
+    const sessionId = store.createSession(f.config).id;
+    const peer = store.createSession(f.config).id;
+    const emitted = store.event({ type: 'state', sessionId, objectiveId: 'objective', data: { status: 'running' } });
+    for (let index = 0; index < 5; index++) store.put('model', {
+      id: `${'a'.repeat(24)}${index.toString().padStart(8, '0')}`, sessionId, objectiveId: 'objective',
+      status: 'completed', input: 10, output: 2, reservation: 0, interaction: 'fixture', error: null,
+    });
+    store.put('action', {
+      id: 'b'.repeat(64), sessionId, objectiveId: 'another-objective', callId: 'private-peer-call',
+      tool: 'private_tool', argsHash: 'fixture', args: { secret: 'fixture-trace-key' }, effect: 'read',
+      status: 'completed', resultId: null, error: null,
+    });
+    const first = store.activity(sessionId, 'objective', undefined, 2);
+    const second = store.activity(sessionId, 'objective', first.next!, 2);
+    const third = store.activity(sessionId, 'objective', second.next!, 2);
+    expect([third, second, first].flatMap(page => page.items).map(item => item.value.id.slice(-1))).toEqual(['0', '1', '2', '3', '4']);
+    expect(third.next).toBeNull();
+    expect(store.activity(peer, 'objective').items).toEqual([]);
+    expect(() => store.activityCall(sessionId, 'objective', 'm-aaaaaaaa')).toThrow('Ambiguous');
+    const call = store.activityCall(sessionId, 'objective', first.items[0]!.value.id);
+    expect(call).toEqual(first.items[0]);
+    expect(() => store.activityCall(peer, 'objective', call.value.id)).toThrow('belongs to this objective');
+    expect(() => store.activityCall(sessionId, 'objective', 't-bbbbbbbb')).toThrow('belongs to this objective');
+    expect(() => store.activity(sessionId, 'objective', -1)).toThrow('Invalid bounded');
+    store.close(); store = new Store(f.config.dataDir);
+    expect(store.events(sessionId)[0]).toEqual(emitted);
+    expect(store.activity(sessionId, 'objective', undefined, 2)).toEqual(first);
   } finally { store.close(); }
 });

@@ -1,56 +1,150 @@
-import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
 import path from 'node:path';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { z } from 'zod';
+import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { loadEnvFile } from 'node:process';
-import { z } from 'zod';
-import { Ajv } from 'ajv';
 import { HarnessError } from './contracts.js';
+import { within } from './files.js';
 
-const mcpServer = z.discriminatedUnion('transport', [
-  z.object({
-    name: z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]{0,30}$/),
-    transport: z.literal('stdio'), command: z.string().min(1),
-    args: z.array(z.string()).default([]),
-    tools: z.array(z.string().min(1)).min(1),
-    trusted: z.literal(true),
-  }).strict(),
-  z.object({
-    name: z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]{0,30}$/),
-    transport: z.literal('http'), url: z.string().url(),
-    tools: z.array(z.string().min(1)).min(1),
-    trusted: z.literal(true),
-  }).strict(),
-]);
-export const configSchema = z.object({
-  version: z.literal(1).default(1),
-  mode: z.enum(['fake', 'openai']).default('openai'),
+export const SDK_VERSION = '1.0.34';
+export const RUNTIME_VERSION = '1.0.112';
+export const DEFAULT_SKILLS_DIRECTORY = path.join('.github', 'skills');
+const origin = z.string().url().transform(value => {
+  const url = new URL(value);
+  if (url.origin !== value || url.username || url.password) throw new HarnessError('CONFIG', 'Use exact origins without paths or credentials.');
+  return value;
+});
+export const v2ConfigSchema = z.object({
+  version: z.literal(2),
   workspace: z.string().min(1),
   dataDir: z.string().min(1),
-  baseURL: z.string().url().optional(),
-  model: z.string().min(1).default(''),
-  instructions: z.string().default('Complete the requested work accurately.'),
-  outputSchema: z.record(z.string(), z.unknown()).optional(),
-  enabledTools: z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/)).min(1).optional(),
-  mcp: z.array(mcpServer).default([]),
+  model: z.object({
+    baseURL: z.string().url(),
+    canonical: z.string().min(1).max(200),
+    wire: z.string().min(1).max(200),
+    wireAPI: z.literal('responses').default('responses'),
+    contextTokens: z.number().int().min(1024).max(2000000).default(32000),
+    outputTokens: z.number().int().min(32).max(128000).default(2048),
+  }).strict(),
+  readOnly: z.boolean().default(false),
+  skillsDirectory: z.string().min(1).max(1000).optional(),
+  enabledTools: z.array(z.string().regex(/^[a-zA-Z0-9_]{1,64}$/)).optional(),
+  network: z.object({
+    origins: z.array(z.union([z.literal('*'), origin])).max(100).default([]),
+    localFixtureOrigins: z.array(origin).max(20).default([]),
+    maxBytes: z.number().int().min(1024).max(10485760).default(5242880),
+    timeoutMs: z.number().int().min(100).max(120000).default(15000),
+    redirects: z.number().int().min(0).max(10).default(3),
+  }).strict().prefault({}),
+  search: z.object({
+    provider: z.literal('brave'),
+    costPerRequest: z.number().nonnegative().optional(),
+  }).strict().optional(),
+  execution: z.object({
+    provider: z.literal('docker'),
+    image: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    memoryMb: z.number().int().min(64).max(8192).default(512),
+    cpus: z.number().min(0.1).max(4).default(1),
+  }).strict().optional(),
+  browser: z.object({
+    executablePath: z.string().min(1),
+    version: z.string().regex(/^\d+\.\d+\.\d+\.\d+$/),
+    javaScript: z.literal(false).default(false),
+  }).strict().optional(),
+  mcp: z.array(z.object({
+    name: z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]{0,20}$/),
+    url: z.string().url(), tools: z.array(z.string().regex(/^[a-zA-Z0-9_]{1,32}$/)).min(1).max(30),
+    trusted: z.literal(true),
+  }).strict()).max(10).default([]),
   limits: z.object({
-    maxIterations: z.number().int().min(1).max(1000).default(30),
-    maxTokens: z.number().int().min(128).default(50000),
-    maxOutputTokens: z.number().int().min(32).default(2048),
-    contextTokens: z.number().int().min(512).default(16000),
-    activeTimeoutMs: z.number().int().min(100).default(300000),
-    toolTimeoutMs: z.number().int().min(50).default(30000),
-    modelTimeoutMs: z.number().int().min(50).default(60000),
-    maxConcurrency: z.number().int().min(1).max(16).default(2),
-    maxFileBytes: z.number().int().min(1).max(10485760).default(262144),
-    maxToolBytes: z.number().int().min(128).max(10485760).default(262144),
+    maxTokens: z.number().int().min(128).default(100000),
+    maxRequests: z.number().int().min(1).max(1000).default(100),
+    maxActions: z.number().int().min(1).max(1000).default(100),
+    maxReplans: z.number().int().min(0).max(20).default(2),
+    timeoutMs: z.number().int().min(100).max(86400000).default(600000),
+    toolTimeoutMs: z.number().int().min(100).max(300000).default(30000),
+    concurrency: z.number().int().min(1).max(8).default(2),
+    maxFileBytes: z.number().int().min(128).max(10485760).default(1048576),
+    maxOutputBytes: z.number().int().min(128).max(10485760).default(1048576),
+    maxResultBytes: z.number().int().min(1024).max(104857600).default(20971520),
+    maxWorkspaceBytes: z.number().int().min(1024).max(1073741824).default(52428800),
+    maxFiles: z.number().int().min(1).max(50000).default(5000),
     maxCost: z.number().positive().optional(),
     inputPerMillion: z.number().nonnegative().optional(),
     outputPerMillion: z.number().nonnegative().optional(),
-  }).prefault({}),
+  }).strict().prefault({}),
 }).strict();
-export type Config = z.infer<typeof configSchema>;
-export type McpConfig = Config['mcp'][number];
+const optionalTokenLimit = z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional();
+export const v3ConfigSchema = v2ConfigSchema.extend({
+  version: z.literal(3),
+  model: v2ConfigSchema.shape.model.extend({
+    contextTokens: optionalTokenLimit,
+    outputTokens: optionalTokenLimit,
+  }),
+  limits: v2ConfigSchema.shape.limits.unwrap().extend({
+    maxTokens: optionalTokenLimit,
+  }).prefault({}),
+});
+export const sessionConfigSchema = z.discriminatedUnion('version', [v2ConfigSchema, v3ConfigSchema]);
+export type Config = z.infer<typeof sessionConfigSchema>;
+
+export function allowsHttpsOrigin(origins: readonly string[], value: string): boolean {
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  return url.protocol === 'https:' && url.origin === value &&
+    (origins.includes('*') || origins.includes(value));
+}
+
+export function parseConfig(value: unknown): Config {
+  const config = sessionConfigSchema.parse(value);
+  config.workspace = realpathSync(path.resolve(config.workspace));
+  if (!lstatSync(config.workspace).isDirectory()) throw new HarnessError('CONFIG', 'Workspace must be an existing directory.');
+  config.dataDir = path.resolve(config.dataDir);
+  if (within(config.workspace, config.dataDir)) throw new HarnessError('CONFIG', 'Application data must be outside the workspace.');
+  const url = new URL(config.model.baseURL);
+  if (url.username || url.password || url.search || url.hash || /\/responses\/?$/.test(url.pathname) ||
+      (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)))) {
+    throw new HarnessError('CONFIG', 'Use an explicit HTTPS API base (HTTP only on loopback), without credentials or /responses.');
+  }
+  if (config.model.outputTokens !== undefined && config.model.contextTokens !== undefined &&
+      config.model.outputTokens >= config.model.contextTokens) throw new HarnessError('CONFIG', 'Output limit must be smaller than context limit.');
+  if ((config.limits.inputPerMillion === undefined) !== (config.limits.outputPerMillion === undefined) ||
+      (config.limits.maxCost !== undefined && config.limits.inputPerMillion === undefined)) {
+    throw new HarnessError('CONFIG', 'Currency accounting requires both input and output prices.');
+  }
+  for (const value of config.network.localFixtureOrigins) {
+    const url = new URL(value);
+    if (!['127.0.0.1', '[::1]'].includes(url.hostname)) throw new HarnessError('CONFIG', 'Local fixtures require literal loopback origins.');
+  }
+  if (config.network.origins.some(value => value !== '*' && new URL(value).protocol !== 'https:')) throw new HarnessError('CONFIG', 'Public origins require HTTPS.');
+  if (config.search && !allowsHttpsOrigin(config.network.origins, 'https://api.search.brave.com')) {
+    throw new HarnessError('CONFIG', 'Brave search requires an allowed HTTPS network origin.');
+  }
+  if (new Set(config.mcp.map(server => server.name)).size !== config.mcp.length) throw new HarnessError('CONFIG', 'Duplicate MCP server name.');
+  for (const server of config.mcp) {
+    const url = new URL(server.url);
+    if (url.username || url.password || url.search || url.hash ||
+        !(allowsHttpsOrigin(config.network.origins, url.origin) || config.network.localFixtureOrigins.includes(url.origin))) {
+      throw new HarnessError('CONFIG', 'MCP requires an explicitly allowed no-auth URL.');
+    }
+  }
+  if (config.browser) config.browser.executablePath = realpathSync(config.browser.executablePath);
+  return config;
+}
+export function loadConfig(file?: string, overrides: Record<string, unknown> = {}): Config {
+  const input = file ? z.record(z.string(), z.unknown()).parse(JSON.parse(readFileSync(file, 'utf8'))) : {};
+  const model = z.record(z.string(), z.unknown()).parse(input.model ?? {});
+  return parseConfig({
+    version: 3, workspace: process.cwd(), dataDir: defaultDataDir(), ...input,
+    model: {
+      ...model,
+      ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
+      ...(process.env.HARNESS_MODEL ? { canonical: process.env.HARNESS_MODEL, wire: process.env.HARNESS_MODEL } : {}),
+      ...(process.env.HARNESS_WIRE_MODEL ? { wire: process.env.HARNESS_WIRE_MODEL } : {}),
+    }, ...overrides,
+  });
+}
 
 export function loadEnvironment(file = path.resolve('.env')): void {
   try { loadEnvFile(file); }
@@ -61,75 +155,8 @@ export function loadEnvironment(file = path.resolve('.env')): void {
 }
 
 export function defaultDataDir(): string {
-  return path.join(process.env.LOCALAPPDATA ?? path.join(homedir(), 'AppData', 'Local'), 'harness-experiment');
-}
-export function parseConfig(value: unknown): Config {
-  const c = configSchema.parse(value);
-  try { c.workspace = realpathSync(path.resolve(c.workspace)); }
-  catch (error) {
-    if (error instanceof Error && 'code' in error && ['ENOENT', 'ENOTDIR'].includes(String(error.code))) {
-      throw new HarnessError('WORKSPACE', 'The workspace folder does not exist. Use --workspace with an existing folder, such as .\\docs in this repository.');
-    }
-    throw error;
-  }
-  if (!statSync(c.workspace).isDirectory()) throw new HarnessError('WORKSPACE', 'The workspace must be an existing folder, not a file.');
-  c.dataDir = path.resolve(c.dataDir);
-  if (c.mode === 'fake') c.model = 'fake-reference-v1';
-  if (c.mode === 'openai' && (!c.baseURL || !c.model)) {
-    throw new HarnessError('CONFIG', 'OpenAI mode requires baseURL and model. Use --fake for offline development.');
-  }
-  if (c.baseURL) {
-    const url = new URL(c.baseURL);
-    if (url.username || url.password || url.search || url.hash) {
-      throw new HarnessError('CONFIG', 'Endpoint credentials, query strings, and fragments are not allowed in baseURL.');
-    }
-    if (/\/responses\/?$/.test(url.pathname)) {
-      throw new HarnessError('CONFIG', 'OPENAI_BASE_URL must be the API base, not the /responses endpoint. Remove the trailing /responses; the SDK adds it.');
-    }
-    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) {
-      throw new HarnessError('CONFIG', 'Use HTTPS for remote endpoints; plain HTTP is allowed only on loopback.');
-    }
-  }
-  if (new Set(c.mcp.map(s => s.name)).size !== c.mcp.length) throw new HarnessError('CONFIG', 'MCP server names must be unique.');
-  for (const s of c.mcp) {
-    if (s.transport === 'http') {
-      const url = new URL(s.url);
-      if (url.username || url.password || url.search || url.hash) throw new HarnessError('CONFIG', 'MCP URLs cannot include credentials or query strings.');
-      if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) {
-        throw new HarnessError('CONFIG', 'MCP requires HTTPS, except for loopback fixtures.');
-      }
-    }
-    if (s.tools.some(t => /shell|exec|computer|python|javascript|terminal|code_interpreter/i.test(t))) {
-      throw new HarnessError('CONFIG', 'Arbitrary execution tools are not enabled in the MVP.');
-    }
-  }
-  if (c.limits.maxCost !== undefined &&
-      (c.limits.inputPerMillion === undefined || c.limits.outputPerMillion === undefined)) {
-    throw new HarnessError('CONFIG', 'Currency budgets require explicit inputPerMillion and outputPerMillion pricing.');
-  }
-  if ((c.limits.inputPerMillion === undefined) !== (c.limits.outputPerMillion === undefined)) {
-    throw new HarnessError('CONFIG', 'Provide both inputPerMillion and outputPerMillion, or neither.');
-  }
-  if (c.outputSchema) {
-    try { new Ajv({ strict: false }).compile(c.outputSchema); }
-    catch { throw new HarnessError('CONFIG', 'outputSchema must be a valid, locally resolvable JSON Schema.'); }
-  }
-  if (c.limits.maxOutputTokens + 256 >= c.limits.contextTokens) {
-    throw new HarnessError('CONFIG', 'contextTokens must leave space beyond maxOutputTokens and instruction overhead.');
-  }
-  return c;
-}
-export function loadConfig(file: string | undefined, overrides: Record<string, unknown> = {}): Config {
-  const base: unknown = file ? JSON.parse(readFileSync(file, 'utf8')) : {};
-  const object = z.record(z.string(), z.unknown()).parse(base);
-  return parseConfig({
-    workspace: process.cwd(), dataDir: defaultDataDir(), ...object,
-    ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
-    ...(process.env.HARNESS_MODEL ? { model: process.env.HARNESS_MODEL } : {}),
-    ...overrides,
-  });
+  return path.join(process.env.LOCALAPPDATA ?? path.join(homedir(), 'AppData', 'Local'), 'harness-experiment', 'v2');
 }
 export function hash(value: unknown): string {
   return createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 }
-export function configHash(config: Config): string { return hash(config); }

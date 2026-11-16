@@ -4,31 +4,41 @@
   "description": "A local, resumable, approval-first agent harness for Windows Terminal.",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.14.0 <23" },
-  "bin": { "harness": "./dist/cli.js", "harness-v2": "./dist/v2/cli.js" },
-  "exports": { ".": "./dist/index.js", "./v2": "./dist/v2/index.js" },
+  "engines": {
+    "node": ">=22.14.0 <23"
+  },
+  "bin": {
+    "harness": "./dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "types": "./dist/index.d.ts",
-  "files": ["dist", "README.md", "docs/V2.md", "SDK_FIRST_LIMITS_PLAN.md", "harness.example.json", "harness.v2.example.json", ".env.example"],
+  "files": [
+    "dist",
+    "README.md",
+    "PRODUCT.md",
+    "ARCHITECTURE.md",
+    "IMPLEMENTATION_PLAN.md",
+    "docs",
+    "SDK_FIRST_LIMITS_PLAN.md",
+    "harness.example.json",
+    ".env.example"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src test",
     "test": "vitest run",
     "dev": "tsx src/cli.tsx",
-    "dev:v2": "tsx src/v2/cli.tsx",
-    "verify:v2": "vitest run test/v2",
-    "verify:v2:terminal": "tsx test/v2/terminal-check.ts",
-    "verify:v2:news": "tsx test/v2/news-live-check.ts",
-    "eval": "tsx test/evaluate.ts",
+    "verify:news": "tsx test/news-live-check.ts",
     "verify:terminal": "tsx test/terminal-check.ts",
     "verify:package": "tsx test/package-check.ts",
-    "verify:live": "tsx test/live-check.ts",
     "prepack": "npm run build"
   },
   "dependencies": {
     "@github/copilot-sdk": "1.0.34",
     "@modelcontextprotocol/sdk": "1.32.2",
-    "@openai/agents": "0.21.0",
     "@types/better-sqlite3": "7.6.13",
     "ajv": "8.17.1",
     "better-sqlite3": "12.4.1",
@@ -36,9 +46,10 @@
     "fs-native-extensions": "1.5.3",
     "ink": "6.8.0",
     "js-yaml": "4.3.2",
-    "openai": "7.53.0",
+    "koffi": "3.3.7",
     "playwright-core": "1.65.0",
     "react": "19.3.1",
+    "wrap-ansi": "9.0.2",
     "zod": "4.3.6"
   },
   "devDependencies": {

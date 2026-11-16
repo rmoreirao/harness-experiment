@@ -7,20 +7,26 @@ A modern agent harness should make agents **controllable, recoverable, observabl
 
 This product view targets a **developer-facing, production-capable general-purpose agent runtime and orchestration harness**. The priorities below are product recommendations, rather than a claim that every framework implements every capability.
 
-## Product Direction and Releases
+## Product direction
 
 The product should let a user delegate meaningful **coding, research, and browser work** from a terminal. A powerful harness combines useful tools with planning, evidence-based completion, permissions, and recovery; it is not simply a larger tool catalog.
 
-| Release | Purpose | Status and scope |
-|---|---|---|
-| V1 / MVP | Establish a local, resumable, approval-first terminal experience and a document-backed reference workflow. | Implementation and verification history remain in `MVP_PRODUCT.md`, `MVP_ARCHITECTURE.md`, and `MVP_IMPLEMENTATION_PLAN.md` at the repository root. |
-| V2 | Generalize the product to source-code work, web research, and controlled browser interaction. | Planned in `V2_PRODUCT.md`, `V2_ARCHITECTURE.md`, and `V2_IMPLEMENTATION_PLAN.md` at the repository root. These capabilities are not yet shipped. |
+The repository contains one implementation for coding, research and controlled
+browser work. Its scope, architecture and acceptance evidence are documented in
+`PRODUCT.md`, `ARCHITECTURE.md` and `IMPLEMENTATION_PLAN.md`.
 
-V2 retains TypeScript, Node.js, Ink, Windows Terminal with PowerShell, and one active session per terminal. It targets **Copilot SDK as the single agent execution backend**, replacing the OpenAI-specific execution layer while retaining useful application infrastructure. LangGraph and Deep Agents are comparison references, not additional orchestration dependencies.
+The product retains TypeScript, Node.js, Ink, Windows Terminal with PowerShell,
+and one active session per terminal. **Copilot SDK is the single agent execution
+backend**. LangGraph and Deep Agents are comparison references, not additional
+orchestration dependencies.
 
-The runtime decision is recorded in `docs\decisions\agent-runtime.md`. Initial SDK compatibility checks are ordinary first implementation tasks, not a separate approval phase or a reason to postpone the full V2 design.
+The runtime decision is recorded in `docs\decisions\agent-runtime.md`.
 
-V2 explicitly promotes general file tools, precise editing, isolated process execution, search/retrieval, browser interaction, task evidence, and reviewed local skills into release scope. The original nice-to-have table below describes the broader product landscape; `V2_PRODUCT.md` decides which capabilities are mandatory for V2.
+General file tools, precise editing, isolated process execution, search/retrieval,
+browser interaction, task evidence and local skills are in product scope.
+The nice-to-have table below describes the broader product landscape;
+`PRODUCT.md` decides mandatory requirements. This research view is not a claim
+that all acceptance gates have passed.
 
 The same user experience should support three outcomes:
 
@@ -89,7 +95,7 @@ The research reviewed official documentation for:
 - **Proactive automation product:** Scheduling becomes a must-have.
 - **Persistent personalization:** Long-term memory becomes a must-have if personalization is the central product promise.
 
-## Recommended V1 Boundary
+## Recommended implementation boundary
 
 Support one model provider, one durable storage backend, custom tools plus MCP, simple workflow composition, approvals, resource limits, traces, and artifact delivery. Build autonomous agent teams afterward.
 

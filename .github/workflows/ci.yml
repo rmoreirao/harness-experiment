@@ -1,4 +1,4 @@
-name: Windows MVP verification
+name: Windows harness verification
 on:
   push:
   pull_request:
@@ -19,6 +19,5 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm run verify:terminal
-      - run: npm run eval
       - run: npm pack
       - run: npm run verify:package

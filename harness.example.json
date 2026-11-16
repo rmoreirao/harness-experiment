@@ -1,22 +1,33 @@
 {
-  "version": 1,
-  "mode": "openai",
-  "workspace": "D:\\documents",
-  "dataDir": "D:\\harness-data",
-  "baseURL": "https://api.openai.com/v1",
-  "model": "REPLACE_WITH_YOUR_MODEL",
-  "instructions": "Summarize approved documents accurately. Cite the source file paths. Ask before reading or saving.",
-  "mcp": [],
+  "version": 3,
+  "workspace": ".",
+  "dataDir": "C:\\Users\\YOUR_USER\\AppData\\Local\\harness-experiment\\v2",
+  "model": {
+    "baseURL": "https://your-endpoint.example/v1",
+    "canonical": "your-canonical-model-identifier",
+    "wire": "your-deployment-identifier",
+    "wireAPI": "responses"
+  },
+  "readOnly": false,
+  "skillsDirectory": ".github\\skills",
+  "network": {
+    "origins": [],
+    "localFixtureOrigins": [],
+    "maxBytes": 5242880,
+    "timeoutMs": 15000,
+    "redirects": 3
+  },
   "limits": {
-    "maxIterations": 30,
-    "maxTokens": 50000,
-    "maxOutputTokens": 2048,
-    "contextTokens": 16000,
-    "activeTimeoutMs": 300000,
-    "modelTimeoutMs": 60000,
+    "maxRequests": 100,
+    "maxActions": 100,
+    "maxReplans": 2,
+    "timeoutMs": 600000,
     "toolTimeoutMs": 30000,
-    "maxConcurrency": 2,
-    "maxFileBytes": 262144,
-    "maxToolBytes": 262144
+    "concurrency": 2,
+    "maxFileBytes": 1048576,
+    "maxOutputBytes": 1048576,
+    "maxResultBytes": 20971520,
+    "maxWorkspaceBytes": 52428800,
+    "maxFiles": 5000
   }
 }

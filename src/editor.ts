@@ -2,7 +2,8 @@ import { terminalText } from './privacy.js';
 
 export type InputAction =
   | { type: 'insert'; text: string }
-  | { type: 'left' | 'right' | 'up' | 'down' | 'home' | 'end' | 'backspace' | 'delete' | 'submit' | 'cancel' | 'exit' | 'pageUp' | 'pageDown' | 'redraw' };
+  | { type: 'mouse'; x: number; y: number; button: number; released: boolean }
+  | { type: 'left' | 'right' | 'up' | 'down' | 'home' | 'end' | 'backspace' | 'delete' | 'submit' | 'cancel' | 'exit' | 'pageUp' | 'pageDown' | 'redraw' | 'traceFocus' };
 
 export class InputDecoder {
   private buffer = '';
@@ -33,6 +34,23 @@ export class InputDecoder {
         this.pasting = true; this.buffer = this.buffer.slice(6); continue;
       }
       if (this.buffer.startsWith('\x1b')) {
+        if (this.buffer.startsWith('\x1b[<')) {
+          const end = this.buffer.slice(3).search(/[@-~]/);
+          if (end < 0) {
+            if (this.buffer.length > 64) this.buffer = '';
+            break;
+          }
+          const sequence = this.buffer.slice(0, end + 4);
+          this.buffer = this.buffer.slice(sequence.length);
+          const mouse = /^(\d{1,3});(\d{1,5});(\d{1,5})([Mm])$/.exec(sequence.slice(3));
+          if (mouse) {
+            const button = Number(mouse[1]); const x = Number(mouse[2]); const y = Number(mouse[3]);
+            if (button <= 255 && x > 0 && x <= 65535 && y > 0 && y <= 65535) {
+              actions.push({ type: 'mouse', button, x, y, released: mouse[4] === 'm' });
+            }
+          }
+          continue;
+        }
         const sequence = Object.keys(sequences).find(s => this.buffer.startsWith(s));
         if (sequence) {
           actions.push({ type: sequences[sequence]! } as InputAction);
@@ -52,6 +70,7 @@ export class InputDecoder {
       else if (codepoint === '\x03') actions.push({ type: 'cancel' });
       else if (codepoint === '\x04') actions.push({ type: 'exit' });
       else if (codepoint === '\x0c') actions.push({ type: 'redraw' });
+      else if (codepoint === '\x14') actions.push({ type: 'traceFocus' });
       else if (codepoint === '\x7f' || codepoint === '\x08') actions.push({ type: 'backspace' });
       else if (codepoint === '\x01') actions.push({ type: 'home' });
       else if (codepoint === '\x05') actions.push({ type: 'end' });

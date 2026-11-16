@@ -1,9 +1,7 @@
 export { SessionController, type OpenOptions } from './controller.js';
-export { parseConfig, loadConfig, defaultDataDir, type Config } from './config.js';
-export { Store, SqliteSession } from './storage.js';
+export { loadConfig, parseConfig, loadEnvironment, defaultDataDir, v2ConfigSchema, v3ConfigSchema, sessionConfigSchema, SDK_VERSION, RUNTIME_VERSION, type Config } from './config.js';
+export { Store } from './store.js';
 export { Ownership } from './ownership.js';
-export { Gateway, type ToolDefinition } from './gateway.js';
-export { FakeModel, type FakeHandler } from './model.js';
-export { executeWorkflow, type WorkflowStep } from './workflow.js';
-export { HarnessError, type AppEvent, type Validator, type LifecycleHook, type RunRecord, type PendingRequest } from './contracts.js';
-export { V2Controller, parseV2Config, loadV2Config, type V2Config } from './v2/index.js';
+export { HarnessError } from './contracts.js';
+export type { SkillInfo } from './skills.js';
+export type { Objective, Action, Decision, Result, Source, Claim, Step, Runtime, RuntimeOptions, ModelLimits, AppEvent } from './contracts.js';
