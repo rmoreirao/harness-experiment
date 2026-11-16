@@ -7,27 +7,35 @@ import { loadV2Config, parseV2Config } from '../../src/v2/config.js';
 import { loadEnvironment } from '../../src/config.js';
 import { errorText } from '../../src/contracts.js';
 import { Redactor } from '../../src/privacy.js';
+import { CopilotRuntime } from '../../src/v2/runtime.js';
 
 async function main(): Promise<void> {
   const { values } = parseArgs({ options: {
     'allow-spending': { type: 'boolean' }, 'max-tokens': { type: 'string' },
+    'max-output-tokens': { type: 'string' },
     config: { type: 'string' }, 'output-dir': { type: 'string' },
   } });
   if (!values['allow-spending'] || !values['max-tokens'] || !values['output-dir']) {
     throw new Error('Live verification requires --allow-spending, --max-tokens and --output-dir. It is never part of the default test suite.');
   }
   const maximum = z.coerce.number().int().min(128).max(100000).parse(values['max-tokens']);
+  const verificationBudget = { maxTokens: maximum,
+    outputTokens: z.coerce.number().int().min(32).max(8192).parse(values['max-output-tokens'] ?? 2048) };
   loadEnvironment();
   const saved = loadV2Config(values.config);
+  if (saved.version !== 3 || saved.limits.maxTokens !== undefined || saved.limits.maxCost !== undefined ||
+      saved.model.contextTokens !== undefined || saved.model.outputTokens !== undefined) {
+    throw new Error('Default-mode news verification requires a version-3 configuration without product token/currency budgets or prompt/output overrides. Existing explicit policies were not changed.');
+  }
   const output = path.resolve(values['output-dir']); mkdirSync(output, { recursive: true });
   const directory = mkdtempSync(path.join(output, 'globo-live-'));
   const workspace = path.join(directory, 'workspace'); mkdirSync(workspace);
   const config = parseV2Config({
     ...saved, workspace, dataDir: path.join(directory, 'state'), skillsDirectory: undefined,
     execution: undefined, browser: undefined, search: undefined, mcp: [],
-    limits: { ...saved.limits, maxTokens: Math.min(saved.limits.maxTokens, maximum) },
   });
-  const app = await V2Controller.open({ config });
+  const app = await V2Controller.open({ config, runtimeFactory: (resources, signal) =>
+    new CopilotRuntime(config, process.env.OPENAI_API_KEY ?? '', resources, signal, verificationBudget) });
   const unsubscribe = app.subscribe(event => {
     if (event.type === 'request') {
       const request = app.inspect().pending.at(-1)!;
@@ -61,7 +69,8 @@ async function main(): Promise<void> {
     })));
     const summary = {
       prompt: objective.original, status: objective.status, reason: objective.reason, model: config.model.canonical,
-      sessionId: app.id, objectiveId: objective.id, usage: objective.usage, tokenCeiling: config.limits.maxTokens,
+      sessionId: app.id, objectiveId: objective.id, usage: objective.usage, productBudget: app.inspect().budget,
+      modelLimits: app.inspect().modelLimits, verificationBudget,
       reports: reports.length, supportedHeadlines: supportedHeadlines.size,
       sources: sources.map(source => ({ url: source.finalUrl, retrieved: source.retrieved, evidence: source.evidence?.length ?? 0 })),
     };
@@ -69,7 +78,7 @@ async function main(): Promise<void> {
     writeFileSync(path.join(directory, 'answer.md'), objective.output);
     console.log(JSON.stringify({ ...summary, directory }, null, 2));
     if (objective.status !== 'completed' || !reports.length || supportedHeadlines.size < 3 ||
-        objective.usage.unknown || objective.usage.reserved || objective.usage.input + objective.usage.output > config.limits.maxTokens) {
+        objective.usage.unknown || objective.usage.reserved || objective.usage.input + objective.usage.output > maximum) {
       throw new Error('The exact news request did not pass live outcome verification. Inspect the retained verification and session evidence.');
     }
   } finally { unsubscribe(); await app.close(); }

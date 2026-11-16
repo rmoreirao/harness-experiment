@@ -139,6 +139,8 @@ export class Research {
           const reservedCost = current.usage.reserved * Math.max(limits.inputPerMillion!, limits.outputPerMillion!) / 1e6;
           if ((current.usage.cost ?? 0) + reservedCost + price > limits.maxCost!) throw new HarnessError('COST_LIMIT', 'Search exceeds the remaining currency budget.');
           current.usage.cost = (current.usage.cost ?? 0) + price;
+          context.action.cost = price;
+          this.store.put('action', context.action);
           this.store.put('objective', current);
         }
         const url = new URL('https://api.search.brave.com/res/v1/web/search');

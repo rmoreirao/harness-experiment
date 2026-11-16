@@ -28,15 +28,22 @@ export class Resources {
   readonly tools: Semaphore;
   readonly models = new Semaphore(1);
   constructor(readonly store: V2Store, readonly config: V2Config, readonly sessionId: string,
-    private readonly objectiveId: () => string) {
+    private readonly objectiveId: () => string, private readonly scope: 'objective' | 'verification' = 'objective') {
     this.tools = new Semaphore(config.limits.concurrency);
   }
   current(): Objective { return this.store.get('objective', this.objectiveId(), this.sessionId); }
+  get hasBudget(): boolean { return this.config.limits.maxTokens !== undefined || this.config.limits.maxCost !== undefined; }
+  pending(): ModelRequest[] {
+    return this.store.list('model', this.sessionId, this.current().id)
+      .filter(request => request.status === 'started' || request.status === 'reserved');
+  }
   check(): Objective {
     const objective = this.current();
     if (!['preparing', 'running', 'awaiting_approval', 'awaiting_input'].includes(objective.status)) throw new HarnessError('INACTIVE', 'No objective is admitted for execution.');
     if (Date.now() >= objective.deadline) throw new HarnessError('TIME_LIMIT', 'Objective deadline reached; waits and restart do not reset it.');
-    if (objective.usage.unknown) throw new HarnessError('UNKNOWN_USAGE', 'Model usage requires reconciliation.');
+    if (this.hasBudget && (objective.usage.unknown || this.config.limits.maxCost !== undefined && objective.usage.cost === null)) {
+      throw new HarnessError('UNKNOWN_USAGE', 'Model usage requires reconciliation before enforcing the configured budget.');
+    }
     return objective;
   }
   action(): void {
@@ -44,15 +51,17 @@ export class Resources {
     if (objective.actions >= this.config.limits.maxActions) throw new HarnessError('ACTION_LIMIT', 'Action cap reached.');
     objective.actions++; this.store.put('objective', objective);
   }
-  reserve(bodyBytes: number, interaction: string, input?: { frameHash: string; items: readonly unknown[] }): ModelRequest {
+  beginModelRequest(bodyBytes: number, interaction: string, input?: { frameHash: string; items: readonly unknown[] },
+    outputLimit?: number | null): ModelRequest {
     const objective = this.check();
     const limits = this.config.limits;
     if (!Number.isSafeInteger(bodyBytes) || bodyBytes < 0) throw new HarnessError('MODEL_BODY', 'Invalid model request byte count.');
-    const fingerprint = input ? {
+    if (objective.usage.requests >= limits.maxRequests) throw new HarnessError('REQUEST_LIMIT', 'Model request cap reached.');
+    const fingerprint = this.hasBudget && input ? {
       frameHash: hash([interaction, input.frameHash]), inputHash: hash(input.items), count: input.items.length,
     } : undefined;
     let inputBound = bodyBytes;
-    if (input && fingerprint) {
+    if (this.hasBudget && input && fingerprint) {
       const prior = this.store.reportedModelAnchor(this.sessionId, fingerprint.frameHash);
       const prefix = prior?.inputFingerprint;
       if (prior && prefix && Number.isSafeInteger(prefix.count) && prefix.count >= 0 && prefix.count <= input.items.length &&
@@ -61,9 +70,16 @@ export class Resources {
         inputBound = Math.min(bodyBytes, prior.input + prior.output + addedBytes);
       }
     }
-    const reservation = inputBound + this.config.model.outputTokens + 4096;
-    if (objective.usage.requests >= limits.maxRequests) throw new HarnessError('REQUEST_LIMIT', 'Model request cap reached.');
-    if (objective.usage.input + objective.usage.output + objective.usage.reserved + reservation > limits.maxTokens) {
+    const output = outputLimit === undefined ? this.config.model.outputTokens : outputLimit;
+    let reservation = 0;
+    if (this.hasBudget) {
+      if (typeof output !== 'number' || !Number.isSafeInteger(output) || output <= 0) {
+        throw new HarnessError('BUDGET_OUTPUT_LIMIT', 'The explicit budget requires a finite request output bound. Set model.outputTokens; no default output limit was invented and no model request was sent.');
+      }
+      reservation = inputBound + output + 4096;
+      if (!Number.isSafeInteger(reservation)) throw new HarnessError('BUDGET_BOUND', 'The request reservation exceeds the safe accounting range; no model request was sent.');
+    }
+    if (limits.maxTokens !== undefined && objective.usage.input + objective.usage.output + objective.usage.reserved + reservation > limits.maxTokens) {
       const used = objective.usage.input + objective.usage.output;
       const available = limits.maxTokens - used - objective.usage.reserved;
       throw new HarnessError('TOKEN_LIMIT', `Insufficient tokens: ${used}/${limits.maxTokens} used; next reservation ${reservation}, remaining ${available}. No model request was sent.`);
@@ -76,8 +92,9 @@ export class Resources {
     }
     const request: ModelRequest = {
       id: randomUUID(), sessionId: this.sessionId, objectiveId: objective.id, reservation,
-      input: 0, output: 0, status: 'reserved', interaction, error: null,
-      requestBytes: bodyBytes, inputBound, inputFingerprint: fingerprint,
+      input: 0, output: 0, status: this.hasBudget ? 'reserved' : 'started', interaction, error: null,
+      requestBytes: bodyBytes, ...(this.hasBudget ? { inputBound, inputFingerprint: fingerprint } : {}),
+      budgetScope: this.hasBudget ? this.scope : 'none',
     };
     this.store.db.transaction(() => {
       objective.usage.reserved += reservation; objective.usage.requests++;
@@ -85,8 +102,11 @@ export class Resources {
     })();
     return request;
   }
+  reserve(bodyBytes: number, interaction: string, input?: { frameHash: string; items: readonly unknown[] }): ModelRequest {
+    return this.beginModelRequest(bodyBytes, interaction, input);
+  }
   settle(request: ModelRequest, usage?: { input: number; output: number }, error?: string, knownNoCharge = false): void {
-    if (this.store.get('model', request.id, this.sessionId).status !== 'reserved') return;
+    if (!['started', 'reserved'].includes(this.store.get('model', request.id, this.sessionId).status)) return;
     const objective = this.store.get('objective', request.objectiveId, this.sessionId);
     const valid = usage && Number.isSafeInteger(usage.input) && usage.input >= 0 &&
       Number.isSafeInteger(usage.output) && usage.output >= 0;
@@ -98,12 +118,12 @@ export class Resources {
       request.input = usage.input; request.output = usage.output;
       objective.usage.input += usage.input; objective.usage.output += usage.output;
       const limits = this.config.limits;
-      if (limits.inputPerMillion !== undefined) {
-        objective.usage.cost = (objective.usage.cost ?? 0) +
+      if (limits.inputPerMillion !== undefined && objective.usage.cost !== null) {
+        objective.usage.cost +=
           (usage.input * limits.inputPerMillion + usage.output * limits.outputPerMillion!) / 1e6;
       }
-      if (usage.input + usage.output > request.reservation) objective.usage.unknown = true;
-    } else if (!knownNoCharge) objective.usage.unknown = true;
+      if (request.status === 'completed' && request.reservation > 0 && usage.input + usage.output > request.reservation) objective.usage.unknown = true;
+    } else if (!knownNoCharge) { objective.usage.unknown = true; objective.usage.cost = null; }
     this.store.db.transaction(() => { this.store.put('model', request); this.store.put('objective', objective); })();
   }
 }

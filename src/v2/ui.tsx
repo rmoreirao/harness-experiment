@@ -176,7 +176,7 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
       for (let index = 0; index < Math.max(1, characters.length); index += width) lines.push(characters.slice(index, index + width).join(''));
       return lines;
     }));
-  const viewport = Math.max(2, dimensions.height - (pending ? 15 : 10) - (state.approveAll ? 1 : 0) - Math.min(4, editor.text.split('\n').length));
+  const viewport = Math.max(2, dimensions.height - (pending ? 16 : 11) - (state.approveAll ? 1 : 0) - Math.min(4, editor.text.split('\n').length));
   const end = Math.max(0, rows.length - offset); const visible = rows.slice(Math.max(0, end - viewport), end);
   const draft = Array.from(editor.text); draft.splice(editor.cursor, 0, '|');
   const cursorRow = Array.from(editor.text).slice(0, editor.cursor).join('').split('\n').length - 1;
@@ -199,7 +199,16 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
     <Text wrap="truncate-end" color={objective?.status === 'failed' || objective?.status === 'recovery_required' ? 'red' : undefined}>
       {terminalText(notice)}
     </Text>
-    <Text dimColor>Tokens {objective ? objective.usage.input + objective.usage.output : 0}/{controller.config.limits.maxTokens} | reserved {objective?.usage.reserved ?? 0} | cost {objective?.usage.cost ?? 'unknown'} | /plan /status /help</Text>
+    <Text dimColor wrap="truncate-end">
+      Usage {objective?.usage.unknown ? `unknown (known ${objective.usage.input + objective.usage.output})` : objective ? objective.usage.input + objective.usage.output : 0}
+      {state.budget.maxTokens !== null ? `/${state.budget.maxTokens}` : ' | no task token budget'}
+      {' | '}cost {objective?.usage.cost ?? 'unknown'}{state.budget.maxCost !== null ? `/${state.budget.maxCost}` : ''}
+      {' | '}in flight {state.pendingModelRequests}
+    </Text>
+    <Text dimColor wrap="truncate-end">
+      Context {state.modelLimits.prompt.used ?? '?'}/{state.modelLimits.prompt.limit ?? '?'} ({state.modelLimits.prompt.source})
+      {' | '}Output {state.modelLimits.output.limit ?? 'default'} ({state.modelLimits.output.source}) | /status
+    </Text>
     <Text color="cyan">&gt; {draft.join('').split('\n').slice(Math.max(0, cursorRow - 1), cursorRow + 3).join('\n')}</Text>
     <Text dimColor>Enter send | Ctrl+J newline | Ctrl+C cancel | PageUp/PageDown inspect</Text>
   </Box>;

@@ -8,7 +8,7 @@ import { Ownership } from '../ownership.js';
 import { Redactor } from '../privacy.js';
 import { V2Store } from './store.js';
 import { parseV2Config, type V2Config } from './config.js';
-import { type Action, type Objective, type Runtime, type V2Event, stepSchema } from './contracts.js';
+import { type Action, type ModelLimits, type Objective, type Runtime, type V2Event, stepSchema } from './contracts.js';
 import { Resources } from './resources.js';
 import { ActionBroker } from './policy.js';
 import { Workspace, safeGit } from './workspace.js';
@@ -50,6 +50,7 @@ export class V2Controller {
   private runtimeOpen = false;
   private runtimeCreated = false;
   private runtimeError: string | null = null;
+  private modelLimits?: ModelLimits;
   private constructor(options: V2OpenOptions, store: V2Store, owner: Ownership, id: string) {
     this.store = store; this.owner = owner; this.id = id;
     const session = store.session(id); this.runtimeId = session.runtimeId;
@@ -85,7 +86,7 @@ export class V2Controller {
           if (request.status === 'pending') { request.status = 'expired'; store.put('decision', request); }
         }
         for (const request of store.list('model', id, objective.id)) {
-          if (request.status === 'reserved') {
+          if (request.status === 'reserved' || request.status === 'started') {
             request.status = 'unknown'; objective.usage.reserved -= request.reservation;
             objective.usage.unknown = true; store.put('model', request);
           }
@@ -133,6 +134,17 @@ export class V2Controller {
       pending: objective ? this.store.list('decision', this.id, objective.id).filter(decision => decision.status === 'pending') : [],
       actions, verificationDomains: objective ? this.verificationDomains(objective, actions) : ['general'],
       recentErrors: this.store.recentActionErrors(this.id),
+      modelLimits: this.modelLimits ?? {
+        model: this.config.model.canonical, providerCapacityVerified: false,
+        prompt: { limit: this.config.model.contextTokens ?? null, used: null,
+          source: this.config.model.contextTokens !== undefined ? 'explicit override' : 'unavailable' },
+        output: { limit: this.config.model.outputTokens ?? null,
+          source: this.config.model.outputTokens !== undefined ? 'explicit override' : 'SDK/provider default' },
+        compactionThreshold: null,
+      },
+      budget: { maxTokens: this.config.limits.maxTokens ?? null, maxCost: this.config.limits.maxCost ?? null,
+        mode: this.resources.hasBudget ? 'explicit' : 'none' },
+      pendingModelRequests: objective ? this.resources.pending().length : 0,
       results: objective ? this.store.list('result', this.id, objective.id) : [],
       grants: this.store.list('grant', this.id).filter(grant => !grant.revoked && grant.expires > Date.now()),
     };
@@ -187,6 +199,7 @@ export class V2Controller {
         await this.runtime.open({
           sessionId: this.runtimeId, resume, directory: path.join(this.config.dataDir, 'runtime', this.id),
           tools: this.broker.tools(), signal: this.aborter.signal, emit: (type, data) => this.emit(type, data),
+          onContext: limits => { this.modelLimits = limits; },
           question: (question, choices, allowFreeform) => this.broker.question(question, choices, allowFreeform),
           beforeStop: () => this.beforeStop(),
         });
@@ -232,7 +245,7 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
   }
   private unknownEffects(): boolean {
     const current = this.resources.current();
-    return current.usage.unknown || current.usage.reserved !== 0 ||
+    return this.resources.hasBudget && current.usage.unknown || current.usage.reserved !== 0 || this.resources.pending().length !== 0 ||
       this.store.list('action', this.id, current.id).some(action => ['started', 'unknown'].includes(action.status));
   }
   private validation(): string[] {
@@ -368,8 +381,14 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
         if (action.status === 'pending') { action.status = 'denied'; action.error = 'Interrupted before dispatch; original request expired.'; this.store.put('action', action); }
       }
       if (this.store.list('action', this.id, objective.id).some(action => ['started', 'unknown'].includes(action.status)) ||
-          this.store.list('model', this.id, objective.id).some(request => request.status === 'unknown')) throw new HarnessError('RECOVERY', 'Every unknown effect and request must be reconciled explicitly.');
-      objective.usage.unknown = false; objective.status = 'partial'; objective.reason = input.note;
+          this.resources.hasBudget && this.store.list('model', this.id, objective.id).some(request => request.status === 'unknown')) throw new HarnessError('RECOVERY', 'Every unknown effect and request must be reconciled explicitly.');
+      objective.usage.unknown = this.store.list('model', this.id, objective.id).some(request => request.status === 'unknown');
+      if (this.config.version === 3 && !objective.usage.unknown && this.config.limits.inputPerMillion !== undefined) {
+        objective.usage.cost = this.store.list('model', this.id, objective.id).reduce((sum, request) => sum +
+          (request.input * this.config.limits.inputPerMillion! + request.output * this.config.limits.outputPerMillion!) / 1e6, 0) +
+          this.store.list('action', this.id, objective.id).reduce((sum, action) => sum + (action.cost ?? 0), 0);
+      }
+      objective.status = 'partial'; objective.reason = input.note;
       this.store.put('objective', objective); this.emit('state', { objective, reconciled: true });
     })();
   }

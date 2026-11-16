@@ -73,7 +73,19 @@ export const v2ConfigSchema = z.object({
     outputPerMillion: z.number().nonnegative().optional(),
   }).strict().prefault({}),
 }).strict();
-export type V2Config = z.infer<typeof v2ConfigSchema>;
+const optionalTokenLimit = z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional();
+export const v3ConfigSchema = v2ConfigSchema.extend({
+  version: z.literal(3),
+  model: v2ConfigSchema.shape.model.extend({
+    contextTokens: optionalTokenLimit,
+    outputTokens: optionalTokenLimit,
+  }),
+  limits: v2ConfigSchema.shape.limits.unwrap().extend({
+    maxTokens: optionalTokenLimit,
+  }).prefault({}),
+});
+export const sessionConfigSchema = z.discriminatedUnion('version', [v2ConfigSchema, v3ConfigSchema]);
+export type V2Config = z.infer<typeof sessionConfigSchema>;
 
 export function allowsHttpsOrigin(origins: readonly string[], value: string): boolean {
   if (!URL.canParse(value)) return false;
@@ -83,7 +95,7 @@ export function allowsHttpsOrigin(origins: readonly string[], value: string): bo
 }
 
 export function parseV2Config(value: unknown): V2Config {
-  const config = v2ConfigSchema.parse(value);
+  const config = sessionConfigSchema.parse(value);
   config.workspace = realpathSync(path.resolve(config.workspace));
   if (!lstatSync(config.workspace).isDirectory()) throw new HarnessError('CONFIG', 'Workspace must be an existing directory.');
   config.dataDir = path.resolve(config.dataDir);
@@ -93,7 +105,8 @@ export function parseV2Config(value: unknown): V2Config {
       (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)))) {
     throw new HarnessError('CONFIG', 'Use an explicit HTTPS API base (HTTP only on loopback), without credentials or /responses.');
   }
-  if (config.model.outputTokens >= config.model.contextTokens) throw new HarnessError('CONFIG', 'Output limit must be smaller than context limit.');
+  if (config.model.outputTokens !== undefined && config.model.contextTokens !== undefined &&
+      config.model.outputTokens >= config.model.contextTokens) throw new HarnessError('CONFIG', 'Output limit must be smaller than context limit.');
   if ((config.limits.inputPerMillion === undefined) !== (config.limits.outputPerMillion === undefined) ||
       (config.limits.maxCost !== undefined && config.limits.inputPerMillion === undefined)) {
     throw new HarnessError('CONFIG', 'Currency accounting requires both input and output prices.');
@@ -121,7 +134,7 @@ export function loadV2Config(file?: string, overrides: Record<string, unknown> =
   const input = file ? z.record(z.string(), z.unknown()).parse(JSON.parse(readFileSync(file, 'utf8'))) : {};
   const model = z.record(z.string(), z.unknown()).parse(input.model ?? {});
   return parseV2Config({
-    version: 2, workspace: process.cwd(), dataDir: path.join(defaultDataDir(), 'v2'), ...input,
+    version: 3, workspace: process.cwd(), dataDir: path.join(defaultDataDir(), 'v2'), ...input,
     model: {
       ...model,
       ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),

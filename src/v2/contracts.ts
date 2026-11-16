@@ -47,6 +47,7 @@ export interface Action {
   resultId: string | null;
   error: string | null;
   errorCode?: string;
+  cost?: number;
 }
 export interface Decision {
   id: string;
@@ -83,13 +84,22 @@ export interface Claim {
 }
 export interface ModelRequest {
   id: string; sessionId: string; objectiveId: string;
-  status: 'reserved' | 'completed' | 'unknown' | 'failed';
+  status: 'started' | 'reserved' | 'completed' | 'unknown' | 'failed';
   reservation: number; input: number; output: number;
   interaction: string; error: string | null;
   requestBytes?: number;
   inputBound?: number;
   reportedUsage?: boolean;
   inputFingerprint?: { frameHash: string; inputHash: string; count: number };
+  budgetScope?: 'objective' | 'verification' | 'none';
+}
+export interface ModelLimits {
+  model: string;
+  prompt: { limit: number | null; used: number | null; source: 'explicit override' | 'runtime reported' | 'unavailable' };
+  output: { limit: number | null; source: 'explicit override' | 'SDK/provider default' };
+  compactionThreshold: number | null;
+  providerCapacityVerified: false;
+  verification?: { maxTokens: number; outputTokens: number };
 }
 export interface Grant {
   id: string; sessionId: string;
@@ -110,7 +120,7 @@ export interface Entities {
   source: Source; claim: Claim; model: ModelRequest; grant: Grant; approvalPolicy: ApprovalPolicy; execution: ExecutionRecord;
 }
 export interface V2Event {
-  sequence?: number; type: 'state' | 'text' | 'action' | 'request' | 'usage' | 'plan' | 'result' | 'error' | 'runtime';
+  sequence?: number; type: 'state' | 'text' | 'action' | 'request' | 'usage' | 'plan' | 'result' | 'error' | 'runtime' | 'context';
   sessionId: string; objectiveId: string | null;
   data: Record<string, unknown>;
 }
@@ -124,6 +134,7 @@ export interface RuntimeOptions {
   emit: (type: V2Event['type'], data: Record<string, unknown>) => void;
   question: (question: string, choices?: string[], allowFreeform?: boolean) => Promise<string>;
   beforeStop: () => Promise<string | null>;
+  onContext?: (limits: ModelLimits) => void;
 }
 export interface Runtime {
   open(options: RuntimeOptions): Promise<void>;

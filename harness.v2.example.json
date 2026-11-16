@@ -1,14 +1,12 @@
 {
-  "version": 2,
+  "version": 3,
   "workspace": ".",
   "dataDir": "C:\\Users\\YOUR_USER\\AppData\\Local\\harness-experiment\\v2",
   "model": {
     "baseURL": "https://your-endpoint.example/v1",
     "canonical": "your-canonical-model-identifier",
     "wire": "your-deployment-identifier",
-    "wireAPI": "responses",
-    "contextTokens": 32000,
-    "outputTokens": 2048
+    "wireAPI": "responses"
   },
   "readOnly": false,
   "skillsDirectory": ".github\\skills",
@@ -20,7 +18,6 @@
     "redirects": 3
   },
   "limits": {
-    "maxTokens": 100000,
     "maxRequests": 100,
     "maxActions": 100,
     "maxReplans": 2,

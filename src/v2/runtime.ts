@@ -8,9 +8,16 @@ import { z } from 'zod';
 import { HarnessError, errorText, record } from '../contracts.js';
 import { hash } from '../config.js';
 import { errorDiagnostic } from '../errors.js';
-import type { Runtime, RuntimeOptions } from './contracts.js';
+import type { ModelLimits, Runtime, RuntimeOptions } from './contracts.js';
 import { RUNTIME_VERSION, type V2Config } from './config.js';
-import type { Resources } from './resources.js';
+import { Resources } from './resources.js';
+
+export interface VerificationBudget { maxTokens: number; outputTokens: number }
+interface TransportControls {
+  admissionFailure?: (error: HarnessError) => void;
+  observeOutput?: (limit: number | null) => void;
+  verification?: VerificationBudget;
+}
 
 export function runtimeEnvironment(home: string): Record<string, string> {
   const env: Record<string, string> = {};
@@ -24,10 +31,21 @@ export function runtimeEnvironment(home: string): Record<string, string> {
   };
 }
 export class ControlledModelTransport extends CopilotRequestHandler {
+  private readonly admission: Resources;
   constructor(private readonly config: V2Config, private readonly key: string, private readonly resources: Resources,
     private readonly objectiveSignal: () => AbortSignal,
     private readonly usage: () => void,
-    private readonly admissionFailure?: (error: HarnessError) => void) { super(); }
+    private readonly controls: TransportControls = {}) {
+    super();
+    const guard = controls.verification;
+    if (guard) {
+      z.object({ maxTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        outputTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict().parse(guard);
+      this.admission = new Resources(resources.store, {
+        ...config, limits: { ...config.limits, maxTokens: Math.min(config.limits.maxTokens ?? guard.maxTokens, guard.maxTokens) },
+      }, resources.sessionId, () => resources.current().id, 'verification');
+    } else this.admission = resources;
+  }
   protected override async openWebSocket(_context: CopilotRequestContext): Promise<CopilotWebSocketHandler> {
     throw new HarnessError('MODEL_TRANSPORT', 'WebSocket model traffic is disabled; only bounded Responses HTTP/SSE is admitted.');
   }
@@ -39,25 +57,29 @@ export class ControlledModelTransport extends CopilotRequestHandler {
     }
     const signal = AbortSignal.any([context.signal, this.objectiveSignal(), AbortSignal.timeout(this.config.limits.toolTimeoutMs)]);
     const release = await this.resources.models.acquire(signal);
-    let reservation: ReturnType<Resources['reserve']> | undefined;
+    let reservation: ReturnType<Resources['beginModelRequest']> | undefined;
     try {
       const body = await request.text();
       if (Buffer.byteLength(body) > this.config.limits.maxResultBytes) throw new HarnessError('MODEL_BODY', 'Model request exceeds its body cap.');
       const data = z.record(z.string(), z.unknown()).parse(JSON.parse(body));
       if (data.model !== this.config.model.wire) throw new HarnessError('MODEL_IDENTITY', 'Runtime selected a wire model outside the fixed configuration.');
-      data.max_output_tokens = this.config.model.outputTokens;
+      const sdkOutput = typeof data.max_output_tokens === 'number' && Number.isSafeInteger(data.max_output_tokens) && data.max_output_tokens > 0
+        ? data.max_output_tokens : null;
+      this.controls.observeOutput?.(sdkOutput);
+      if (this.controls.verification) data.max_output_tokens = Math.min(sdkOutput ?? this.controls.verification.outputTokens, this.controls.verification.outputTokens);
+      const outputLimit = this.controls.verification ? Number(data.max_output_tokens) : sdkOutput;
       const encoded = JSON.stringify(data);
-      const items: unknown[] | undefined = Array.isArray(data.input) ? data.input : undefined;
-      const frameHash = hash(Object.fromEntries(Object.entries(data).filter(([key]) => key !== 'input')));
-      reservation = this.resources.reserve(Buffer.byteLength(encoded), context.interactionType ?? 'model-or-auxiliary',
-        items ? { frameHash, items } : undefined);
+      const items: unknown[] | undefined = this.admission.hasBudget && Array.isArray(data.input) ? data.input : undefined;
+      const fingerprint = items ? { frameHash: hash(Object.fromEntries(Object.entries(data).filter(([key]) => key !== 'input'))), items } : undefined;
+      reservation = this.admission.beginModelRequest(Buffer.byteLength(encoded), context.interactionType ?? 'model-or-auxiliary',
+        fingerprint, outputLimit);
       const response = await fetch(expected, {
         method: 'POST', signal, redirect: 'error',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', Authorization: `Bearer ${this.key}` },
         body: encoded,
       });
       if (!response.ok || !response.body) {
-        this.resources.settle(reservation, undefined, `HTTP ${response.status}`);
+        this.admission.settle(reservation, undefined, `HTTP ${response.status}`);
         this.usage(); release();
         this.recordError({
           name: 'ModelHTTPError', code: 'MODEL_HTTP', message: `Model endpoint returned HTTP ${response.status}.`,
@@ -71,7 +93,7 @@ export class ControlledModelTransport extends CopilotRequestHandler {
       const finish = (error?: string) => {
         if (settled) return;
         settled = true;
-        this.resources.settle(reservation!, usage, error); this.usage(); release();
+        this.admission.settle(reservation!, usage, error); this.usage(); release();
       };
       const stream = new ReadableStream<Uint8Array>({
         pull: async controller => {
@@ -110,11 +132,11 @@ export class ControlledModelTransport extends CopilotRequestHandler {
       });
       return new Response(stream, { status: response.status, headers: { 'Content-Type': response.headers.get('content-type') ?? 'application/json' } });
     } catch (error) {
-      if (reservation) { this.resources.settle(reservation, undefined, errorText(error)); this.usage(); }
+      if (reservation) { this.admission.settle(reservation, undefined, errorText(error)); this.usage(); }
       release(); this.recordError(error, reservation?.id, false);
       if (!reservation && error instanceof HarnessError) {
         const diagnostic = errorDiagnostic(error, this.resources.store.redactor);
-        this.admissionFailure?.(error);
+        this.controls.admissionFailure?.(error);
         return new Response(JSON.stringify({ error: {
           type: 'harness_admission_error', code: diagnostic.code, message: diagnostic.message,
         } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -157,17 +179,30 @@ export class CopilotRuntime implements Runtime {
   private session?: CopilotSession;
   private options?: RuntimeOptions;
   private unsubscribe?: () => void;
+  private context?: ModelLimits;
+  private wireOutput?: number | null;
   constructor(private readonly config: V2Config, private readonly key: string, private readonly resources: Resources,
-    private readonly signal: () => AbortSignal) {}
+    private readonly signal: () => AbortSignal, private readonly verification?: VerificationBudget) {}
   async open(options: RuntimeOptions): Promise<void> {
     this.options = options;
+    this.context = undefined; this.wireOutput = undefined;
     mkdirSync(options.directory, { recursive: true });
     const working = path.join(options.directory, 'empty-workspace');
     mkdirSync(working, { recursive: true });
     const transport = new ControlledModelTransport(this.config, this.key, this.resources, this.signal,
       () => options.emit('usage', { usage: this.resources.current().usage }),
-      error => options.emit('error', errorDiagnostic(error, this.resources.store.redactor,
-        { source: 'model', operation: 'request admission', model: this.config.model.wire, streamStarted: false })));
+      {
+        admissionFailure: error => options.emit('error', errorDiagnostic(error, this.resources.store.redactor,
+          { source: 'model', operation: 'request admission', model: this.config.model.wire, streamStarted: false })),
+        verification: this.verification,
+        observeOutput: limit => {
+          this.wireOutput = limit;
+          if (this.context) {
+            this.context.output.limit = limit ?? this.config.model.outputTokens ?? null;
+            this.publishContext();
+          }
+        },
+      });
     this.client = new CopilotClient({
       mode: 'empty', baseDirectory: options.directory, workingDirectory: working,
       useLoggedInUser: false, env: runtimeEnvironment(options.directory), logLevel: 'none',
@@ -188,7 +223,8 @@ export class CopilotRuntime implements Runtime {
           baseUrl: this.config.model.baseURL, modelId: this.config.model.canonical, wireModel: this.config.model.wire,
           // The real credential remains in the host-side transport, never in the runtime journal.
           apiKey: 'harness-host-owned-credential',
-          maxPromptTokens: this.config.model.contextTokens, maxOutputTokens: this.config.model.outputTokens,
+          ...(this.config.model.contextTokens !== undefined ? { maxPromptTokens: this.config.model.contextTokens } : {}),
+          ...(this.config.model.outputTokens !== undefined ? { maxOutputTokens: this.config.model.outputTokens } : {}),
         },
         name: 'Harness V2', configDirectory: options.directory, workingDirectory: working, streaming: true,
         availableTools: options.tools.map(tool => `custom:${runtimeToolName(tool.name)}`), excludedTools: ['builtin:*', 'mcp:*'],
@@ -234,6 +270,7 @@ export class CopilotRuntime implements Runtime {
         ? await this.client.resumeSession(options.sessionId, { ...config, continuePendingWork: false, allowTranscriptRecovery: false })
         : await this.client.createSession({ ...config, sessionId: options.sessionId });
       this.unsubscribe = this.session.on(event => this.event(event));
+      await this.refreshContext();
       options.signal.throwIfAborted();
     } catch (error) { await this.close(); throw error; }
   }
@@ -243,11 +280,42 @@ export class CopilotRuntime implements Runtime {
     else if (event.type === 'assistant.message') options.emit('text', { message: event.data.content });
     else if (event.type === 'session.error') options.emit('error', errorDiagnostic(event.data, this.resources.store.redactor, { source: 'runtime' }));
     else if (event.type === 'session.idle') options.emit('runtime', { state: 'idle' });
+    else if (event.type === 'session.usage_info' && this.context) {
+      this.context.prompt.used = event.data.currentTokens;
+      this.publishContext();
+    }
     else if (event.type.includes('compaction')) options.emit('runtime', { state: event.type });
   }
   async send(prompt: string): Promise<void> {
     if (!this.session) throw new HarnessError('RUNTIME', 'Runtime is not open.');
     await this.session.sendAndWait({ prompt }, this.config.limits.timeoutMs);
+    await this.refreshContext();
+  }
+  private async refreshContext(): Promise<void> {
+    if (!this.session) return;
+    const info = (await this.session.rpc.metadata.contextInfo({
+      promptTokenLimit: 0, outputTokenLimit: 0, resolveOutputTokenLimit: false,
+    })).contextInfo;
+    this.context = {
+      model: this.config.model.canonical, providerCapacityVerified: false,
+      prompt: {
+        limit: info?.promptTokenLimit ?? this.config.model.contextTokens ?? null,
+        used: info?.totalTokens ?? null,
+        source: this.config.model.contextTokens !== undefined ? 'explicit override' : info ? 'runtime reported' : 'unavailable',
+      },
+      output: {
+        limit: this.wireOutput ?? this.config.model.outputTokens ?? null,
+        source: this.config.model.outputTokens !== undefined ? 'explicit override' : 'SDK/provider default',
+      },
+      compactionThreshold: info?.compactionThreshold ?? null,
+      ...(this.verification ? { verification: this.verification } : {}),
+    };
+    this.publishContext();
+  }
+  private publishContext(): void {
+    if (!this.context) return;
+    this.options?.onContext?.(this.context);
+    this.options?.emit('context', { limits: this.context });
   }
   async updatePlan(content: string): Promise<void> {
     if (!this.session) throw new HarnessError('RUNTIME', 'Runtime is not open.');

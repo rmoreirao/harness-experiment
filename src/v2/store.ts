@@ -6,7 +6,7 @@ import { Redactor } from '../privacy.js';
 import { hash } from '../config.js';
 import { HarnessError } from '../contracts.js';
 import { errorId, errorPage, errorSequence, storedError, type ErrorPage, type ErrorRecord, type ErrorRow } from '../errors.js';
-import { SDK_VERSION, RUNTIME_VERSION, v2ConfigSchema, type V2Config } from './config.js';
+import { SDK_VERSION, RUNTIME_VERSION, sessionConfigSchema, type V2Config } from './config.js';
 import type { Entities, Objective, Result, V2Event } from './contracts.js';
 
 interface DataRow { data: string }
@@ -50,10 +50,12 @@ export class V2Store {
     const row = this.db.prepare<[string], { runtime_id: string; config: string; digest: string; sdk: string; runtime: string; created: number }>(
       'SELECT * FROM sessions WHERE id=?').get(id);
     if (!row) throw new HarnessError('SESSION', 'No V2 session with that identity.');
-    const config = v2ConfigSchema.parse(JSON.parse(row.config));
-    if (hash(config) !== row.digest || row.sdk !== SDK_VERSION || row.runtime !== RUNTIME_VERSION) {
+    const saved: unknown = JSON.parse(row.config);
+    if (hash(saved) !== row.digest || row.sdk !== SDK_VERSION || row.runtime !== RUNTIME_VERSION) {
       throw new HarnessError('COMPATIBILITY', 'Stored runtime/configuration is incompatible; no automatic conversion.');
     }
+    const config = sessionConfigSchema.parse(saved);
+    if (hash(config) !== row.digest) throw new HarnessError('COMPATIBILITY', 'Stored configuration defaults changed; no automatic conversion.');
     return { id, runtimeId: row.runtime_id, config, created: row.created };
   }
   sessions(): V2Session[] {
