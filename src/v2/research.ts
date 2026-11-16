@@ -132,17 +132,21 @@ export class Research {
       }).strict(), 'network', async (args, context) => {
         if (!this.searchKey) throw new HarnessError('SEARCH_CREDENTIAL', 'BRAVE_SEARCH_API_KEY is missing. No search was performed.');
         const price = this.network.config.search!.costPerRequest;
+        const current = broker.resources.check();
         if (this.network.config.limits.maxCost !== undefined) {
           if (price === undefined) throw new HarnessError('SEARCH_COST', 'Currency-capped search requires an explicit upper-bound costPerRequest.');
-          const current = broker.resources.check();
           const limits = this.network.config.limits;
           const reservedCost = current.usage.reserved * Math.max(limits.inputPerMillion!, limits.outputPerMillion!) / 1e6;
           if ((current.usage.cost ?? 0) + reservedCost + price > limits.maxCost!) throw new HarnessError('COST_LIMIT', 'Search exceeds the remaining currency budget.');
-          current.usage.cost = (current.usage.cost ?? 0) + price;
+        }
+        if (price !== undefined) {
+          if (current.usage.cost !== null) current.usage.cost += price;
           context.action.cost = price;
+        } else { current.usage.cost = null; context.action.cost = null; }
+        this.store.db.transaction(() => {
           this.store.put('action', context.action);
           this.store.put('objective', current);
-        }
+        })();
         const url = new URL('https://api.search.brave.com/res/v1/web/search');
         url.searchParams.set('q', args.query); url.searchParams.set('count', String(args.count)); url.searchParams.set('offset', String(args.offset));
         const response = await this.network.retrieve(url.href, context.signal, { headers: { 'X-Subscription-Token': this.searchKey }, redirects: false });
@@ -150,7 +154,7 @@ export class Research {
           title: z.string(), url: z.string().url(), description: z.string(),
         })) }).optional() }).parse(JSON.parse(response.body.toString('utf8')));
         return { provider: 'brave', retrieved: Date.now(), evidence: false, results: data.web?.results ?? [], offset: args.offset,
-          configuredMaximumCharge: price ?? null, charging: 'Currency-capped requests reserve/charge the configured maximum before dispatch, including failed requests.' };
+          configuredMaximumCharge: price ?? null, charging: 'Configured maximum charges are recorded before dispatch, including failed requests; absent prices keep aggregate cost unknown.' };
       });
     }
     const reference = z.union([

@@ -9,6 +9,26 @@ import { fixture, skillFile, ScriptRuntime } from './helpers.js';
 
 async function settle() { await new Promise(resolve => setTimeout(resolve, 70)); }
 describe('V2 A08 terminal continuity', () => {
+  it('distinguishes uncapped usage, unknown billing and current context/output provenance', async () => {
+    const f = fixture({ version: 3 });
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => {
+      app.resources.settle(app.resources.beginModelRequest(200, 'synthetic', undefined, null));
+      runtime.message('A verified answer with unknown billing.');
+    }) });
+    const screen = render(<V2TerminalApp controller={app} />);
+    try {
+      await settle();
+      expect(screen.lastFrame()).toContain('no task token budget');
+      expect(screen.lastFrame()).toContain('Context ?/? (unavailable)');
+      expect(screen.lastFrame()).toContain('SDK/provider default');
+      await app.submit('Complete without a task quota.'); await settle();
+      expect(screen.lastFrame()).toContain('Usage unknown');
+      expect(screen.lastFrame()).toContain('no task token budget');
+      expect(screen.lastFrame()).toContain('cost unknown');
+      expect(screen.lastFrame()).not.toContain('/undefined');
+      expect(screen.lastFrame()).not.toContain('/100000');
+    } finally { screen.unmount(); await app.close(); f.cleanup(); }
+  });
   it('pages historical action errors and excludes successful actions and their private arguments', async () => {
     const f = fixture();
     const app = await V2Controller.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async () => {}) });

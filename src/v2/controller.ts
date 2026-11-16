@@ -88,7 +88,7 @@ export class V2Controller {
         for (const request of store.list('model', id, objective.id)) {
           if (request.status === 'reserved' || request.status === 'started') {
             request.status = 'unknown'; objective.usage.reserved -= request.reservation;
-            objective.usage.unknown = true; store.put('model', request);
+            objective.usage.unknown = true; objective.usage.cost = null; store.put('model', request);
           }
         }
         this.emit('state', { skills: this.listSkills() });
@@ -245,7 +245,7 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
   }
   private unknownEffects(): boolean {
     const current = this.resources.current();
-    return this.resources.hasBudget && current.usage.unknown || current.usage.reserved !== 0 || this.resources.pending().length !== 0 ||
+    return (this.resources.hasBudget && current.usage.unknown) || current.usage.reserved !== 0 || this.resources.pending().length !== 0 ||
       this.store.list('action', this.id, current.id).some(action => ['started', 'unknown'].includes(action.status));
   }
   private validation(): string[] {
@@ -361,6 +361,7 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
     if (this.job || !input.note.trim()) throw new HarnessError('RECOVERY', 'Stop work and provide a reconciliation note.');
     const objective = this.resources.current();
     if (objective.status !== 'recovery_required') throw new HarnessError('RECOVERY', 'No objective requires reconciliation.');
+    if (this.resources.pending().length) throw new HarnessError('RECOVERY', 'Pending model requests must finish or be recovered after restart before reconciliation.');
     this.store.db.transaction(() => {
       for (const resolution of input.actions ?? []) {
         const action = this.store.get('action', resolution.id, this.id);
@@ -373,7 +374,7 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
         if (request.objectiveId !== objective.id || request.status !== 'unknown') throw new HarnessError('RECOVERY', 'Invalid unknown model-request identity.');
         request.status = 'completed'; request.input = usage.input; request.output = usage.output;
         objective.usage.input += usage.input; objective.usage.output += usage.output;
-        if (this.config.limits.inputPerMillion !== undefined) objective.usage.cost = (objective.usage.cost ?? 0) +
+        if (this.config.version === 2 && this.config.limits.inputPerMillion !== undefined) objective.usage.cost = (objective.usage.cost ?? 0) +
           (usage.input * this.config.limits.inputPerMillion + usage.output * this.config.limits.outputPerMillion!) / 1e6;
         this.store.put('model', request);
       }
@@ -383,10 +384,13 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
       if (this.store.list('action', this.id, objective.id).some(action => ['started', 'unknown'].includes(action.status)) ||
           this.resources.hasBudget && this.store.list('model', this.id, objective.id).some(request => request.status === 'unknown')) throw new HarnessError('RECOVERY', 'Every unknown effect and request must be reconciled explicitly.');
       objective.usage.unknown = this.store.list('model', this.id, objective.id).some(request => request.status === 'unknown');
+      if (objective.usage.unknown) objective.usage.cost = null;
       if (this.config.version === 3 && !objective.usage.unknown && this.config.limits.inputPerMillion !== undefined) {
-        objective.usage.cost = this.store.list('model', this.id, objective.id).reduce((sum, request) => sum +
-          (request.input * this.config.limits.inputPerMillion! + request.output * this.config.limits.outputPerMillion!) / 1e6, 0) +
-          this.store.list('action', this.id, objective.id).reduce((sum, action) => sum + (action.cost ?? 0), 0);
+        const actions = this.store.list('action', this.id, objective.id);
+        objective.usage.cost = actions.some(action => action.cost === null) ? null :
+          this.store.list('model', this.id, objective.id).reduce((sum, request) => sum +
+            (request.input * this.config.limits.inputPerMillion! + request.output * this.config.limits.outputPerMillion!) / 1e6, 0) +
+            actions.reduce((sum, action) => sum + (action.cost ?? 0), 0);
       }
       objective.status = 'partial'; objective.reason = input.note;
       this.store.put('objective', objective); this.emit('state', { objective, reconciled: true });

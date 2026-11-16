@@ -8,7 +8,7 @@
   "bin": { "harness": "./dist/cli.js", "harness-v2": "./dist/v2/cli.js" },
   "exports": { ".": "./dist/index.js", "./v2": "./dist/v2/index.js" },
   "types": "./dist/index.d.ts",
-  "files": ["dist", "README.md", "docs/V2.md", "harness.example.json", "harness.v2.example.json", ".env.example"],
+  "files": ["dist", "README.md", "docs/V2.md", "SDK_FIRST_LIMITS_PLAN.md", "harness.example.json", "harness.v2.example.json", ".env.example"],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",

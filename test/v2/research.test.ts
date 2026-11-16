@@ -1,11 +1,12 @@
 import { createServer } from 'node:http';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { V2Controller } from '../../src/v2/controller.js';
 import { ProtectedNetwork, publicAddress } from '../../src/v2/network.js';
 import { readable } from '../../src/v2/research.js';
 import { parseV2Config } from '../../src/v2/config.js';
 import { fixture, ScriptRuntime, approve } from './helpers.js';
 import type { Source } from '../../src/v2/contracts.js';
+import { complete, message, provider } from '../provider-fixture.js';
 
 async function site() {
   const server = createServer((request, response) => {
@@ -36,6 +37,60 @@ async function site() {
   return { ipv4, ipv6, close: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); } };
 }
 describe('V2 A03/A06 protected retrieval and evidence', () => {
+  it('completes the exact Globo prompt through the real SDK in uncapped mode with three supported synthetic headlines', async () => {
+    const reportText = 'Synthetic headline one; Synthetic headline two; Synthetic headline three. Article pages and publication dates were not verified.';
+    const endpoint = await provider((response, _body, count) => {
+      const source = app.store.list('source', app.id, app.inspect().objective!.id)[0];
+      let name: string; let args: unknown;
+      if (count === 1) { name = 'web_fetch'; args = { url: 'https://www.globo.com/' }; }
+      else if (count === 2) {
+        name = 'research_claim'; args = { text: reportText, uncertainty: 'Synthetic homepage fixture only; not live news.',
+          support: source!.evidence!.map(evidence => ({ sourceId: source!.id, evidenceId: evidence.id })) };
+      } else if (count === 3) {
+        name = 'research_report'; args = { report: `${reportText} [source:${source!.id}]` };
+      } else if (count === 4) {
+        const result = app.inspect().results.find(result => result.provenance.kind === 'research_report')!;
+        name = 'work_plan'; args = { steps: [{ id: 'news', title: 'Verify the synthetic homepage headlines',
+          expected: 'A cited report with three supported headline records', status: 'done', results: [result.id] }] };
+      } else {
+        const answer = `${reportText} [source:${source!.id}]`;
+        complete(response, 'news_answer', message(answer), answer, { input_tokens: 40000, output_tokens: 2000, total_tokens: 42000 });
+        return;
+      }
+      complete(response, `news_${count}`, [{ id: `news_call_${count}`, call_id: `news_call_${count}`,
+        type: 'function_call', name: `harness_${name}`, arguments: JSON.stringify(args), status: 'completed' }],
+      undefined, { input_tokens: 40000, output_tokens: 2000, total_tokens: 42000 });
+    });
+    const retrieval = vi.spyOn(ProtectedNetwork.prototype, 'retrieve').mockImplementation(async url => ({
+      url, finalUrl: url, status: 200, headers: { 'content-type': 'text/html' }, redirects: [],
+      body: Buffer.from(`<title>Synthetic Globo-style fixture</title><!--${'x'.repeat(2650000)}--><main>
+        <h2><a href="https://g1.globo.com/noticia/synthetic-one">Synthetic headline one</a></h2>
+        <h2><a href="https://g1.globo.com/noticia/synthetic-two">Synthetic headline two</a></h2>
+        <h2><a href="https://g1.globo.com/noticia/synthetic-three">Synthetic headline three</a></h2></main>`),
+    }));
+    const f = fixture({ version: 3, network: { origins: ['*'] } });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' }); approve(app);
+    try {
+      const before = Date.now();
+      const objective = await app.submit('what are latest news on globo.com?');
+      expect(objective.status, objective.reason ?? '').toBe('completed');
+      expect(objective.usage).toMatchObject({ input: 200000, output: 10000, requests: 5, reserved: 0, unknown: false });
+      expect(objective.steps).toEqual([expect.objectContaining({ status: 'done' })]);
+      expect(app.inspect()).toMatchObject({ budget: { mode: 'none', maxTokens: null, maxCost: null }, pendingModelRequests: 0, pending: [] });
+      const source = app.store.list('source', app.id, objective.id)[0]!;
+      expect(source.retrieved).toBeGreaterThanOrEqual(before);
+      expect(source.published).toBeNull();
+      expect(source.evidence).toHaveLength(3);
+      expect(objective.output).toContain(reportText);
+      expect(app.store.list('claim', app.id, objective.id)[0]?.support).toHaveLength(3);
+      expect(app.inspect().results.filter(result => result.provenance.kind === 'research_report')).toHaveLength(1);
+      expect(endpoint.requests.every(request => request.max_output_tokens === undefined)).toBe(true);
+      expect(retrieval).toHaveBeenCalledTimes(1);
+      expect(app.store.errors(app.id).errors).toHaveLength(0);
+    } finally { await app.close(); retrieval.mockRestore(); await endpoint.close(); f.cleanup(); }
+  }, 60000);
+
   it('decodes HTML5 numeric/named entities once without executing encoded content', () => {
     const result = readable(Buffer.from('<title>A &amp; B</title><p>&#x27;cashback&#39; &#8364; &#x1F30D; &amp;#x27;</p><script>untrusted-script</script>'), 'text/html');
     expect(result.title).toBe('A & B');

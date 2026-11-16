@@ -1,27 +1,29 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { V2Controller } from '../../src/v2/controller.js';
-import { parseV2Config } from '../../src/v2/config.js';
+import { loadV2Config, parseV2Config } from '../../src/v2/config.js';
 import { fixture, ScriptRuntime, approve } from './helpers.js';
 import { complete, message, provider } from '../provider-fixture.js';
 import { Workspace } from '../../src/v2/workspace.js';
 import { hash } from '../../src/config.js';
 
 describe('V2 A07 hard admission, accounting and explicit stop states', () => {
-  it('retains model HTTP status and provider request IDs without storing the rejected response body', async () => {
+  it.each([2, 3])('retains model HTTP status and provider request IDs without storing the rejected response body (version %i)', async version => {
     const endpoint = await provider(response => response.writeHead(401, {
       'Content-Type': 'application/json', 'x-request-id': 'v2-auth-request',
     }).end(JSON.stringify({ error: { message: 'PRIVATE_RESPONSE_BODY' } })));
-    const f = fixture();
+    const f = fixture({ version });
     const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
     const app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' });
     try {
-      await app.submit('PRIVATE_USER_PROMPT');
+      const objective = await app.submit('PRIVATE_USER_PROMPT');
+      expect(objective.status).toBe(version === 2 ? 'recovery_required' : 'failed');
       const error = app.store.errors(app.id).errors.find(error => error.source === 'model' && error.httpStatus === 401)!;
       expect(error).toMatchObject({
         httpStatus: 401, providerRequestId: 'v2-auth-request', code: 'MODEL_HTTP', streamStarted: false,
       });
+
       expect(error.callId).toBeTruthy();
       expect(JSON.stringify(error)).not.toContain('PRIVATE_RESPONSE_BODY');
       expect(JSON.stringify(error)).not.toContain('PRIVATE_USER_PROMPT');
@@ -235,4 +237,95 @@ describe('V2 A07 hard admission, accounting and explicit stop states', () => {
       expect(result.usage.requests).toBe(1);
     } finally { await app.close(); await endpoint.close(); f.cleanup(); }
   }, 30000);
+});
+
+describe('SDK-first configuration and optional accounting', () => {
+  it('omits task and provider token limits for new launches and rejects ambiguous limit sentinels', () => {
+    const f = fixture({ version: 3 });
+    try {
+      const config = loadV2Config(undefined, { workspace: f.workspace, dataDir: f.dataDir, model: f.config.model });
+      expect(config.version).toBe(3);
+      expect(config.model.contextTokens).toBeUndefined();
+      expect(config.model.outputTokens).toBeUndefined();
+      expect(config.limits.maxTokens).toBeUndefined();
+      expect(config.limits.maxCost).toBeUndefined();
+      for (const value of [0, null, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() => parseV2Config({ ...config, limits: { ...config.limits, maxTokens: value } })).toThrow();
+        expect(() => parseV2Config({ ...config, model: { ...config.model, contextTokens: value } })).toThrow();
+        expect(() => parseV2Config({ ...config, model: { ...config.model, outputTokens: value } })).toThrow();
+      }
+    } finally { f.cleanup(); }
+  });
+  it.each([2, 3])('preserves version-%i saved policy and digest across cold resume and rejects tampering', async version => {
+    const f = fixture({ version });
+    const runtimeFactory = () => new ScriptRuntime(async runtime => runtime.message('Saved policy preserved.'));
+    let app = await V2Controller.open({ config: f.config, runtimeFactory }); const id = app.id;
+    try {
+      await app.submit('Preserve the saved configuration.');
+      if (version === 2) {
+        expect(app.config.model).toMatchObject({ contextTokens: 32000, outputTokens: 2048 });
+        expect(app.config.limits.maxTokens).toBe(100000);
+      }
+      const digest = hash(app.config);
+      await app.close();
+      app = await V2Controller.open({ config: f.config, sessionId: id, runtimeFactory });
+      expect(hash(app.store.session(id).config)).toBe(digest);
+      const saved = app.store.db.prepare<[string], { config: string; digest: string }>('SELECT config,digest FROM sessions WHERE id=?').get(id)!;
+      expect(saved.digest).toBe(digest);
+      app.store.db.prepare('UPDATE sessions SET config=? WHERE id=?').run(JSON.stringify({ ...f.config, readOnly: !f.config.readOnly }), id);
+      expect(() => app.store.session(id)).toThrow('incompatible');
+    } finally { await app.close(); f.cleanup(); }
+  });
+  it('accounts above 100,000 without hashing input, consulting prefix anchors or reserving tokens', async () => {
+    const f = fixture({ version: 3 });
+    const runtime = new ScriptRuntime(async runtime => {
+      for (let index = 0; index < 2; index++) {
+        const request = app.resources.beginModelRequest(2000000, 'conversation-agent', {
+          frameHash: 'not-an-accounting-anchor',
+          items: [{ toJSON: () => { throw new Error('Uncapped input must not be fingerprinted.'); } }],
+        }, null);
+        expect(request).toMatchObject({ reservation: 0, status: 'started', budgetScope: 'none' });
+        expect(request.inputBound).toBeUndefined();
+        expect(request.inputFingerprint).toBeUndefined();
+        expect(app.inspect().pendingModelRequests).toBe(1);
+        app.resources.settle(request, { input: 64000, output: 4000 });
+        app.resources.settle(request, { input: 64000, output: 4000 });
+      }
+      runtime.message('Actual usage is counted once without a cumulative quota.');
+    });
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime });
+    const anchor = vi.spyOn(app.store, 'reportedModelAnchor').mockImplementation(() => { throw new Error('No prefix lookup is permitted.'); });
+    try {
+      const objective = await app.submit('Exercise uncapped accounting.');
+      expect(objective.status, objective.reason ?? '').toBe('completed');
+      expect(objective.usage).toMatchObject({ input: 128000, output: 8000, reserved: 0, requests: 2, unknown: false });
+      expect(anchor).not.toHaveBeenCalled();
+      expect(app.inspect().pendingModelRequests).toBe(0);
+    } finally { anchor.mockRestore(); await app.close(); f.cleanup(); }
+  });
+  it('blocks pending uncapped requests, recovers them on restart and keeps billing uncertainty after explicit effect reconciliation', async () => {
+    const f = fixture({ version: 3, limits: { inputPerMillion: 1, outputPerMillion: 2 } });
+    let app = await V2Controller.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => {
+      app.resources.beginModelRequest(100, 'interrupted', undefined, null);
+      runtime.message('An unfinished request cannot count as completion.');
+    }) });
+    const id = app.id;
+    try {
+      const first = await app.submit('Recover the same interrupted objective.');
+      expect(first.status).toBe('recovery_required');
+      expect(first.usage.reserved).toBe(0);
+      expect(app.inspect().pendingModelRequests).toBe(1);
+      await expect(app.reconcile({ note: 'Still pending.' })).rejects.toThrow('Pending model');
+      await app.close();
+      app = await V2Controller.open({ config: f.config, sessionId: id,
+        runtimeFactory: () => new ScriptRuntime(async runtime => runtime.message('External state was inspected; billing remains unknown.')) });
+      expect(app.inspect().pendingModelRequests).toBe(0);
+      expect(app.inspect().objective?.usage).toMatchObject({ unknown: true, cost: null, requests: 1 });
+      expect(app.store.list('model', id, first.id)[0]?.status).toBe('unknown');
+      await app.reconcile({ note: 'No external effects require replay; the provider did not report billing.' });
+      const continued = await app.continueObjective();
+      expect(continued).toMatchObject({ id: first.id, deadline: first.deadline, status: 'completed',
+        usage: { unknown: true, cost: null, requests: 1 } });
+    } finally { await app.close(); f.cleanup(); }
+  });
 });

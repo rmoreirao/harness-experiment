@@ -47,7 +47,7 @@ export interface Action {
   resultId: string | null;
   error: string | null;
   errorCode?: string;
-  cost?: number;
+  cost?: number | null;
 }
 export interface Decision {
   id: string;

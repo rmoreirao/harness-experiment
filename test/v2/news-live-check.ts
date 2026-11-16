@@ -67,17 +67,31 @@ async function main(): Promise<void> {
       const source = sources.find(source => source.id === reference.sourceId);
       return source?.evidence?.filter(evidence => evidence.url && evidence.quote === reference.quote).map(evidence => evidence.id) ?? [];
     })));
+    const actions = app.inspect().actions;
+    const cleanup: { state: 'pending' | 'completed' | 'failed'; error: string | null } = { state: 'pending', error: null };
     const summary = {
       prompt: objective.original, status: objective.status, reason: objective.reason, model: config.model.canonical,
       sessionId: app.id, objectiveId: objective.id, usage: objective.usage, productBudget: app.inspect().budget,
       modelLimits: app.inspect().modelLimits, verificationBudget,
+      requests: app.store.list('model', app.id, objective.id).map(request => ({
+        id: request.id, interaction: request.interaction, status: request.status, budgetScope: request.budgetScope,
+        input: request.input, output: request.output,
+      })),
+      actions: { total: actions.length, completed: actions.filter(action => action.status === 'completed').length,
+        failed: actions.filter(action => ['failed', 'denied', 'unknown'].includes(action.status)).length },
+      failures: app.store.errors(app.id).errors.map(error => ({ id: error.id, code: error.code, source: error.source, message: error.message })),
+      pendingRequests: app.inspect().pendingModelRequests, pendingDecisions: app.inspect().pending.length, cleanup,
       reports: reports.length, supportedHeadlines: supportedHeadlines.size,
       sources: sources.map(source => ({ url: source.finalUrl, retrieved: source.retrieved, evidence: source.evidence?.length ?? 0 })),
     };
     writeFileSync(path.join(directory, 'verification.json'), JSON.stringify(summary, null, 2));
     writeFileSync(path.join(directory, 'answer.md'), objective.output);
+    try { await app.close(); cleanup.state = 'completed'; }
+    catch (error) { cleanup.state = 'failed'; cleanup.error = app.store.redactor.text(errorText(error)); throw error; }
+    finally { writeFileSync(path.join(directory, 'verification.json'), JSON.stringify(summary, null, 2)); }
     console.log(JSON.stringify({ ...summary, directory }, null, 2));
     if (objective.status !== 'completed' || !reports.length || supportedHeadlines.size < 3 ||
+        summary.pendingRequests || summary.pendingDecisions ||
         objective.usage.unknown || objective.usage.reserved || objective.usage.input + objective.usage.output > maximum) {
       throw new Error('The exact news request did not pass live outcome verification. Inspect the retained verification and session evidence.');
     }

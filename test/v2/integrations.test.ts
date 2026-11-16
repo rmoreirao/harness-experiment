@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { describe, it, expect, vi } from 'vitest';
 import { V2Controller } from '../../src/v2/controller.js';
 import { ProtectedNetwork } from '../../src/v2/network.js';
+import { parseV2Config } from '../../src/v2/config.js';
 import { fixture, ScriptRuntime, approve } from './helpers.js';
 import { httpFixture } from '../mcp-fixture.js';
 
@@ -117,5 +118,36 @@ describe('V2 A01/A06 integration trust and A07 paid tool admission', () => {
       expect((await unknown.submit('Refuse an unknown tool charge.')).status).toBe('partial');
       expect(requests).toBe(1);
     } finally { await unknown?.close(); await app.close(); fetch.mockRestore(); f.cleanup(); }
+  });
+  it.each([true, false])('reconciles model billing without losing priced searches or inventing unknown tool charges (priced: %s)', async priced => {
+    const f = fixture({
+      version: 3, network: { origins: ['https://api.search.brave.com'] },
+      search: { provider: 'brave', ...(priced ? { costPerRequest: 0.02 } : {}) },
+      limits: { ...(priced ? { maxCost: 1 } : { maxTokens: 100000 }), inputPerMillion: 2, outputPerMillion: 3 },
+    });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, outputTokens: 128 } });
+    const fetch = vi.spyOn(ProtectedNetwork.prototype, 'retrieve').mockImplementation(async url => ({
+      url, finalUrl: url, status: 200, headers: {}, body: Buffer.from('{"web":{"results":[]}}'), redirects: [],
+    }));
+    const runtime = new ScriptRuntime(async runtime => {
+      app.resources.settle(app.resources.beginModelRequest(100, 'known'), { input: 10, output: 2 });
+      await runtime.call('web_search', { query: 'Synthetic charge accounting' });
+      app.resources.settle(app.resources.beginModelRequest(100, 'missing'));
+      runtime.message('Model billing requires explicit reconciliation.');
+    });
+    const app = await V2Controller.open({ config, searchKey: 'synthetic-search-key', runtimeFactory: () => runtime }); approve(app);
+    try {
+      const objective = await app.submit('Preserve known and unknown tool charges.');
+      expect(objective.status).toBe('recovery_required');
+      expect(objective.usage.cost).toBeNull();
+      const request = app.store.list('model', app.id, objective.id).find(request => request.status === 'unknown')!;
+      await app.reconcile({ note: 'Provider confirms the missing model usage.', usage: [{ id: request.id, input: 20, output: 4 }] });
+      const usage = app.inspect().objective!.usage;
+      expect(usage).toMatchObject({ input: 30, output: 6, unknown: false });
+      if (priced) expect(usage.cost).toBeCloseTo(0.020078, 10);
+      else expect(usage.cost).toBeNull();
+      expect(app.inspect().actions.find(action => action.tool === 'web_search')?.cost).toBe(priced ? 0.02 : null);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally { await app.close(); fetch.mockRestore(); f.cleanup(); }
   });
 });

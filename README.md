@@ -15,6 +15,10 @@ use `/skills list` and `/skills reload` to inspect and refresh the loaded set.
 In V2, `/approve_all` approves every pending and future tool call for the session,
 including after resume; `/approve_all off` restores per-call approvals.
 Questions and capability/safety restrictions remain in force.
+New V2 sessions use SDK/provider prompt/output defaults and no mandatory
+100,000-token task cap. Optional explicit budgets are supported; existing
+version-2 sessions keep their saved policy. See the V2 guide before running
+uncapped paid workloads.
 
 The offline reference workflow and regression suite use a deterministic fake
 model through the real Agents SDK. Fake output is prominently labeled and is

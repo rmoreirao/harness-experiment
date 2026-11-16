@@ -1,8 +1,11 @@
 # SDK-first model limits and optional task budgets
 
 Date: 2026-11-16.
-Status: implementation plan, validated with SDK/protocol probes and one isolated
-live news prototype. The production refactor is not implemented.
+Status: implemented for new version-3 sessions. Automated, native-terminal and
+clean-package validation passed. The freshly authorized paid Globo acceptance
+run also passed: 42,730 reported tokens, eight requests, four supported headline
+records and one verified report. Product policy remained uncapped; the run used
+separately labeled verifier-only ceilings.
 
 ## Outcome
 
@@ -218,7 +221,7 @@ must not be confused with default uncapped behavior.
 | Historical exact-goal baseline, 2026-11-15 | Completed: 80,490 tokens, 12 calls, three supported headlines under old overrides/cap. | Historical baseline only, not validation of the new design. |
 | New isolated live prototype, 2026-11-16 | **Completed: 50,501 tokens, nine calls, one verified report, four supported headlines**, configured `gpt-6-luna`, fresh `https://www.globo.com/` evidence. | SDK prompt override omitted. Independent verifier-only ceilings were 100,000 tokens and 2,048 output tokens; fully automatic output-field behavior was probed synthetically, not paid/unbounded. |
 | Redirect handling | `globo.com` produced an explicit redirect diagnostic, then `www.globo.com` was separately approved and fetched. No citation/report/plan failures occurred in this live prototype. | Existing safety/evidence controls preserved; no automatic broadening. |
-| Production files/configuration | No runtime implementation or existing user configuration changed by these planning probes. | The mandatory default cap remains until this plan is implemented. |
+| Production files/configuration during planning | No runtime implementation or existing user configuration changed by those planning probes. | Historical planning-time state, superseded by the implementation validation below. |
 
 The live comparison is observational, not proof that automatic context alone
 reduced usage: page contents, model behavior and workflow improvements differ.
@@ -230,12 +233,51 @@ Retained session artifacts: `model-limits-probe.json`,
 and `sdk-first-news-mnSBYk\answer.md` / `verification.json` with the isolated
 product evidence. No credentials are included in this plan or public summaries.
 
+## Implementation validation, 2026-11-16
+
+The version-3 launch example and local launch configuration now omit the product
+token budget and provider prompt/output overrides. Version-2 saved configuration
+and integrity checks remain intact. No historical session was rewritten.
+
+| Case | Observed result | Scope |
+|---|---|---|
+| Full regression | **151 tests passed in 23 files**, with the installed Docker and Chromium fixtures enabled. | Repository-wide deterministic suite; no paid model calls. |
+| Types, lint and build | `npm run typecheck`, `npm run lint`, and `npm run build` passed. | Final implementation. |
+| SDK-first model defaults | Real SDK requests omit `max_output_tokens`; default, unknown-model and unavailable-metadata cases preserve explicit provenance. Deliberate 48,000 / 1,536 overrides survive cold resume. | Synthetic Responses endpoint, pinned real SDK/runtime; no provider-capacity verification claimed. |
+| Uncapped accounting | A real SDK tool turn completed at **126,000 cumulative reported tokens**. Direct ledger coverage also confirms no prefix lookup/fingerprinting or token reservation and idempotent settlement. | Synthetic usage, not paid consumption. |
+| Exact prompt: `what are latest news on globo.com?` | **Completed through the real SDK:** five requests, **210,000 cumulative reported tokens**, three supported headline records, one cited report and completed plan; no pending work or errors. | Deterministic **synthetic** Globo-style HTML, including a 2.65 MB raw payload. This is not a live news retrieval or live model-quality test. |
+| Optional policies | Token/currency denials occur before provider dispatch; missing finite SDK output bounds fail explicitly rather than inventing a default. Verification ceilings are separate from product policy. | Positive and negative fixtures; no implicit spending policy restored. |
+| Missing billing/recovery | Uncapped answers retain unknown usage/null cost without failing solely for billing uncertainty. Pending models, unknown external effects and actual model failures remain blocking. Search charges and unknown tool prices survive reconciliation. | Real SDK missing-usage fixtures plus durable recovery and tool-charge tests. |
+| Compaction and cold resume | Native background summarization settles before product stop validation; the SDK applies its summary on a later turn. Original objective records and counters survive application and cold resume. Cancellation releases the request ledger and concurrency slot. | Synthetic reported context pressure against the real SDK; not production-load/provider stress coverage. |
+| Windows terminal | `npm run verify:v2:terminal` passed in PowerShell/ConPTY, including uncapped display, independent terminals, interrupted approvals, cold resume and owned shutdown. | Real native terminal; physical clipboard/font checks remain manual. |
+| Clean package | Packed installation passed `npm run verify:package`: MVP continuity, V2 CLI/API/docs, version-3 uncapped defaults and unchanged SDK output omission, native SQLite/locks and private-file exclusion. | Clean temporary npm installation; no registry publication. |
+| Fresh paid Globo run | **Passed:** `gpt-6-luna`, eight completed requests, **42,730 reported tokens** (41,491 input / 1,239 output), four supported headline records, one verified report and completed plan. | Fresh user authorization; current `https://www.globo.com/` evidence retrieved at **2026-11-16T11:38:24.076Z**. Independent verifier ceilings: 100,000 total tokens / 2,048 output tokens per call; product token/currency budgets and prompt/output overrides remained absent. |
+| Live redirect and cleanup | The initial cross-origin redirect was explicitly refused, then the destination was separately approved and retrieved. No citation, model or quota-refusal failures occurred; zero pending requests/decisions and owned cleanup completed. | One expected `REDIRECT` diagnostic, not silent cross-origin access. No retry of the paid acceptance run was needed. |
+
+Compaction validation exposed two timing/cleanup issues and the implementation
+was adjusted: SDK idle can precede background summarizer settlement, and an
+aborted body reader can itself reject cancellation. The runtime now waits for
+`session.compaction_summarized` (or completion), without waiting indefinitely
+for later summary application, and settles the stream ledger in `finally`.
+The cancellation regression confirms no premature completion or leaked pending
+model request.
+
+Post-implementation live evidence is retained in session artifacts
+`sdk-first-live-acceptance-20261116\globo-live-S7R5iv\verification.json` and
+`answer.md`, alongside the private source/claim/report ledger. The final answer
+groups four supported headline records into three readable bullets and notes
+that homepage headlines can change; article bodies were not retrieved.
+
 ## Delivery/remaining gates
 
-The plan is ready to implement; the isolated SDK-first news prototype passed.
-Acceptance of the final production change still requires the implementation
-steps and regression matrix above. Production uncapped accounting, configuration
-migration, new UI behavior, automatic output with a live deployment, and
-compaction stress/recovery are not marked passed by the planning experiment.
+The implementation, local automated validation and freshly authorized bounded
+live acceptance are complete. The updated verifier records its independent
+ceilings, request/tool counts, failures, uncapped product budget mode and
+successful cleanup. It used a fresh version-3 default-mode session without
+changing the user's product configuration or historical sessions.
+
+Automatic output-field omission is verified on the synthetic wire, not with
+unrestricted paid output. Production-load compaction, exhaustive failure
+injection and unrelated V2 release gates are not declared complete.
 No SDK upgrade, new model framework, model/provider fallback, workspace shell
 fallback, or unrelated V2 release work is part of this change.

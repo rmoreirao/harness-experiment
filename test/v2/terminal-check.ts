@@ -15,7 +15,7 @@ const endpoint = await provider((response, _body, count) => {
   }]);
   else complete(response, `native_response_${count}`, message('Synthetic V2 native terminal result.'), 'Synthetic V2 native terminal result.');
 });
-const f = fixture();
+const f = fixture({ version: 3 });
 const config = path.join(f.directory, 'config.json');
 writeFileSync(config, JSON.stringify({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } }));
 const cli = fileURLToPath(new URL('../../dist/v2/cli.js', import.meta.url));
@@ -66,7 +66,7 @@ const sessions = () => {
   try { return store.sessions().map(session => session.id); } finally { store.close(); }
 };
 try {
-  let first = start(); await first.wait('HARNESS V2'); const id = sessions()[0]!;
+  let first = start(); await first.wait('HARNESS V2'); await first.wait('no task token budget'); const id = sessions()[0]!;
   const second = start(); await second.wait('HARNESS V2');
   if (sessions().length !== 2) throw new Error('V2 terminal sessions are not independent.');
   const duplicate = start(id); await duplicate.wait('already owned'); await duplicate.exit();

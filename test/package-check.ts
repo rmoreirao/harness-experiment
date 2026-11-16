@@ -25,7 +25,8 @@ try {
   if (!version.includes('0.1.0')) throw new Error('Installed CLI version check failed.');
   const v2Version = execFileSync(process.execPath, [path.join(directory, 'dist', 'v2', 'cli.js'), '--version'], { encoding: 'utf8' });
   if (!v2Version.includes('runtime 1.0.112') || !existsSync(path.join(directory, 'harness.v2.example.json')) ||
-      !existsSync(path.join(directory, 'docs', 'V2.md')) || existsSync(path.join(directory, 'harness.v2.local.json'))) {
+      !existsSync(path.join(directory, 'docs', 'V2.md')) || !existsSync(path.join(directory, 'SDK_FIRST_LIMITS_PLAN.md')) ||
+      existsSync(path.join(directory, 'harness.v2.local.json'))) {
     throw new Error('V2 CLI/runtime pin, configuration, documentation or private-file exclusion failed.');
   }
   const workspace = path.join(root, 'documents'); mkdirSync(workspace);
@@ -54,9 +55,10 @@ try {
   const v2Script = `
     const {V2Controller,parseV2Config}=await import(process.argv[1]);
     const {createServer}=await import('node:http');
-    let calls=0;
+    let calls=0,wire;
     const server=createServer(async(req,res)=>{
-      for await(const chunk of req){void chunk;}
+      const chunks=[];for await(const chunk of req){chunks.push(Buffer.from(chunk));}
+      wire=JSON.parse(Buffer.concat(chunks).toString('utf8'));
       if(req.headers.authorization!=='Bearer synthetic-installed-package-key'){res.writeHead(401).end();return;}
       calls++;
       const output=[{id:'installed_msg',type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:'Installed Copilot runtime verified.',annotations:[]}]}];
@@ -77,13 +79,14 @@ try {
     try{
       const result=await app.submit('Synthetic installed package verification.');
       if(result.status!=='completed'||result.usage.input!==10||calls!==1)throw new Error(JSON.stringify(result));
+      if(config.limits.maxTokens!==undefined||wire.max_output_tokens!==undefined||app.inspect().budget.mode!=='none')throw new Error('SDK-first installed defaults were overridden.');
     }finally{
       await app.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
     }
   `;
   execFileSync(process.execPath, ['--input-type=module', '-e', v2Script,
     pathToFileURL(path.join(directory, 'dist', 'v2', 'index.js')).href,
-    JSON.stringify({ version: 2, workspace, dataDir: path.join(root, 'v2-state') })],
+    JSON.stringify({ version: 3, workspace, dataDir: path.join(root, 'v2-state') })],
   { encoding: 'utf8', env, timeout: 30000, stdio: 'pipe' });
   console.log('PASS clean npm install: MVP approval/restart/output, V2 CLI/API/docs, bundled real Copilot runtime with synthetic BYOK/usage, SQLite/locks and private-file exclusion.');
 } finally { rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); }

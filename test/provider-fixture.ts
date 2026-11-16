@@ -5,7 +5,8 @@ export const providerKey = 'synthetic-provider-wire-key';
 function event(res: ServerResponse, type: string, data: Record<string, unknown>): void {
   res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
 }
-export function complete(res: ServerResponse, id: string, output: Record<string, unknown>[], text?: string, usage = true): void {
+export function complete(res: ServerResponse, id: string, output: Record<string, unknown>[], text?: string,
+  usage: boolean | { input_tokens: number; output_tokens: number; total_tokens: number } = true): void {
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
   event(res, 'response.created', { response: { id, object: 'response', status: 'in_progress', output: [] } });
   for (const [index, item] of output.entries()) {
@@ -23,7 +24,7 @@ export function complete(res: ServerResponse, id: string, output: Record<string,
   }
   event(res, 'response.completed', { response: {
     id, object: 'response', created_at: 1, model: 'wire-fixture', status: 'completed', output,
-    usage: usage ? { input_tokens: 100, output_tokens: 40, total_tokens: 140 } : undefined,
+    usage: usage === true ? { input_tokens: 100, output_tokens: 40, total_tokens: 140 } : usage || undefined,
   } });
   res.end();
 }

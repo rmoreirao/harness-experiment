@@ -67,7 +67,7 @@ describe('V2 A05/A08 actual process continuity and legacy preservation', () => {
   it('runs independent headless terminals with real SDK children, rejects conflicting commands, and exposes bounded results', async () => {
     const endpoint = await provider((response, _body, count) => complete(response, `resp_cli_${count}`,
       message('Synthetic headless result.'), 'Synthetic headless result.'));
-    const f = fixture();
+    const f = fixture({ version: 3 });
     const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
     const file = path.join(f.directory, 'config.json'); writeFileSync(file, JSON.stringify(config));
     const one = client(file, f.workspace); const two = client(file, f.workspace);
@@ -84,14 +84,20 @@ describe('V2 A05/A08 actual process continuity and legacy preservation', () => {
       const resultTwo = await two.wait(record => record.id === 'run-two' && record.type === 'objective');
       expect(resultOne.objective).toMatchObject({ status: 'completed', original: 'Synthetic process one.' });
       expect(resultTwo.objective).toMatchObject({ status: 'completed', original: 'Synthetic process two.' });
+      one.send('limits', 'inspect');
+      expect((await one.wait(record => record.id === 'limits')).result).toMatchObject({
+        budget: { mode: 'none', maxTokens: null, maxCost: null },
+        modelLimits: { providerCapacityVerified: false, prompt: { source: 'runtime reported' },
+          output: { limit: null, source: 'SDK/provider default' } },
+      });
       one.send('audit', 'events', { limit: 1 });
       expect((await one.wait(record => record.id === 'audit')).result).toHaveLength(1);
       expect(endpoint.requests).toHaveLength(2);
     } finally { await Promise.all([close(one.process), close(two.process)]); await endpoint.close(); f.cleanup(); }
   }, 60000);
 
-  it('persists unknown external effects, requires exact reconciliation and never replays them on cold continuation', async () => {
-    const f = fixture(); const external = path.join(f.directory, 'effect.txt');
+  it.each([2, 3])('persists unknown external effects, requires exact reconciliation and never replays them on version-%i cold continuation', async version => {
+    const f = fixture({ version }); const external = path.join(f.directory, 'effect.txt');
     let effects = 0;
     const runtime = new ScriptRuntime(async runtime => { await runtime.call('fixture_effect', {}); });
     let app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime }); const id = app.id;

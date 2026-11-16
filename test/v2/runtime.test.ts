@@ -1,14 +1,232 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
+import { CopilotClient } from '@github/copilot-sdk';
 import { V2Controller } from '../../src/v2/controller.js';
 import { parseV2Config } from '../../src/v2/config.js';
 import { provider, complete, message } from '../provider-fixture.js';
 import { fixture, skillFile, approve, ScriptRuntime } from './helpers.js';
 import { HarnessError } from '../../src/contracts.js';
+import { CopilotRuntime } from '../../src/v2/runtime.js';
 
 describe('V2 A01 real pinned Copilot SDK/runtime over synthetic Responses', () => {
+  it('uses SDK defaults and finishes a real tool turn above 100,000 cumulative reported tokens without reservations', async () => {
+    const text = 'SDK-owned context and uncapped cumulative usage verified.';
+    const usage = { input_tokens: 40000, output_tokens: 2000, total_tokens: 42000 };
+    const endpoint = await provider((response, _body, count) => count < 3
+      ? complete(response, `auto_tool_${count}`, [{ id: `auto_call_${count}`, call_id: `auto_call_${count}`,
+        type: 'function_call', name: 'harness_work_inspect', arguments: '{}', status: 'completed' }], undefined, usage)
+      : complete(response, 'auto_answer', message(text), text, usage));
+    const f = fixture({ version: 3 });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' });
+    try {
+      const result = await app.submit('Exercise the actual SDK-first default path.');
+      expect(result.status, result.reason ?? '').toBe('completed');
+      expect(result.usage).toMatchObject({ input: 120000, output: 6000, requests: 3, reserved: 0, unknown: false });
+      expect(endpoint.requests).toHaveLength(3);
+      expect(endpoint.requests.every(request => request.max_output_tokens === undefined)).toBe(true);
+      expect(app.store.list('model', app.id, result.id).every(request => request.reservation === 0 && request.budgetScope === 'none')).toBe(true);
+      expect(app.inspect()).toMatchObject({ budget: { mode: 'none', maxTokens: null, maxCost: null },
+        modelLimits: { providerCapacityVerified: false, prompt: { source: 'runtime reported' },
+          output: { limit: null, source: 'SDK/provider default' } } });
+      expect(app.inspect().modelLimits.prompt.limit).toBeGreaterThan(32000);
+    } finally { await app.close(); await endpoint.close(); f.cleanup(); }
+  }, 60000);
+
+  it('lets the SDK compact reported context pressure and cold-resume without rewriting objective evidence or resetting usage', async () => {
+    let app: V2Controller;
+    let produced = false;
+    const text = 'Synthetic compaction preserved the requested objective.';
+    const endpoint = await provider((response, _body, count) => {
+      const request = app.store.list('model', app.id, app.inspect().objective!.id).at(-1)!;
+      if (request.interaction.includes('compaction')) {
+        complete(response, `compact_${count}`, message('Synthetic summary: the generated-context tool completed; preserve the original objective and recorded product evidence.'),
+          'Synthetic summary: the generated-context tool completed; preserve the original objective and recorded product evidence.');
+      } else if (!produced) {
+        produced = true;
+        complete(response, 'large_context', [{ id: 'large_context_call', call_id: 'large_context_call', type: 'function_call',
+          name: 'harness_fixture_context', arguments: '{}', status: 'completed' }], undefined,
+        { input_tokens: 110000, output_tokens: 1000, total_tokens: 111000 });
+      } else complete(response, `after_compaction_${count}`, message(text), text);
+    });
+    const f = fixture({ version: 3, limits: { maxRequests: 8 } });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' }); const id = app.id;
+    app.broker.register('fixture_context', 'Generate disposable synthetic context.', z.object({}).strict(), 'internal',
+      () => ({ generated: 'Synthetic context-pressure fixture.' }));
+    try {
+      const first = await app.submit('Preserve this exact synthetic objective through SDK compaction.');
+      expect(first.status, first.reason ?? '').toBe('completed');
+      const events = app.store.events(id);
+      const records = app.store.list('model', id, first.id);
+      expect(events.some(event => event.type === 'runtime' && event.data.state === 'session.compaction_summarized' && event.data.success),
+        JSON.stringify({ states: events.filter(event => event.type === 'runtime').map(event => event.data.state),
+          limits: app.inspect().modelLimits, interactions: records.map(request => request.interaction) })).toBe(true);
+      expect(records.some(request => request.interaction.includes('compaction'))).toBe(true);
+      expect(first.usage.requests).toBe(records.length);
+      expect(first.usage.input).toBe(records.reduce((sum, request) => sum + request.input, 0));
+      expect(first.usage.output).toBe(records.reduce((sum, request) => sum + request.output, 0));
+      expect(app.inspect().pendingModelRequests).toBe(0);
+      const second = await app.submit('Let the SDK apply its settled background summary.');
+      expect(second.status, second.reason ?? '').toBe('completed');
+      expect(app.store.events(id).some(event => event.type === 'runtime' && event.data.state === 'session.compaction_complete' && event.data.success)).toBe(true);
+      await app.close();
+      app = await V2Controller.open({ config, sessionId: id, apiKey: 'synthetic-provider-wire-key' });
+      expect(app.inspect().objective).toEqual(second);
+      expect((await app.submit('Continue with the native compacted conversation.')).status).toBe('completed');
+      expect(app.store.get('objective', first.id, id)).toEqual(first);
+      expect(app.store.list('model', id, first.id)).toEqual(records);
+      expect(app.inspect().modelLimits.prompt.source).toBe('runtime reported');
+    } finally { await app.close(); await endpoint.close(); f.cleanup(); }
+  }, 60000);
+
+  it('cancels owned model work while waiting for background compaction instead of hanging or completing early', async () => {
+    let compacting = false;
+    const endpoint = await provider((response, _body, count) => {
+      const request = app.store.list('model', app.id, app.inspect().objective!.id).at(-1)!;
+      if (request.interaction.includes('compaction')) {
+        compacting = true; response.writeHead(200, { 'Content-Type': 'text/event-stream' }); response.flushHeaders();
+      } else if (count === 1) {
+        complete(response, 'cancel_context', [{ id: 'cancel_context_call', call_id: 'cancel_context_call', type: 'function_call',
+          name: 'harness_work_inspect', arguments: '{}', status: 'completed' }], undefined,
+        { input_tokens: 110000, output_tokens: 1000, total_tokens: 111000 });
+      } else complete(response, 'cancel_wait', message('Wait for the owned compaction request.'), 'Wait for the owned compaction request.');
+    });
+    const f = fixture({ version: 3, limits: { toolTimeoutMs: 10000 } });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' });
+    try {
+      const work = app.submit('Cancel safely while background compaction is pending.');
+      await vi.waitFor(() => expect(compacting).toBe(true), { timeout: 5000 });
+      expect(app.inspect().busy).toBe(true);
+      expect(app.inspect().pendingModelRequests).toBe(1);
+      await app.cancel();
+      const objective = await work;
+      expect(objective.status).toBe('cancelled');
+      expect(objective.usage).toMatchObject({ reserved: 0, unknown: true, cost: null });
+      expect(app.inspect().pendingModelRequests).toBe(0);
+    } finally { await app.close(); await endpoint.close(); f.cleanup(); }
+  }, 30000);
+
+  it('labels unknown-model fallback metadata as runtime-reported, never provider-verified capacity', async () => {
+    const endpoint = await provider(response => complete(response, 'unknown_model', message('Synthetic unknown-model answer.'), 'Synthetic unknown-model answer.'));
+    const f = fixture({ version: 3 });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, canonical: 'harness-unknown-model', baseURL: endpoint.baseURL } });
+    const app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' });
+    try {
+      expect((await app.submit('Use the selected synthetic unknown model.')).status).toBe('completed');
+      expect(app.inspect().modelLimits).toMatchObject({ model: 'harness-unknown-model', providerCapacityVerified: false,
+        prompt: { source: 'runtime reported' }, output: { limit: null, source: 'SDK/provider default' } });
+      expect(endpoint.requests[0]).toMatchObject({ model: 'synthetic-deployment' });
+      expect(endpoint.requests[0]).not.toHaveProperty('max_output_tokens');
+    } finally { await app.close(); await endpoint.close(); f.cleanup(); }
+  }, 30000);
+
+  it.each(['missing', 'failed'])('keeps %s cached context metadata nonfatal and explicitly unavailable', async mode => {
+    const original = CopilotClient.prototype.createSession;
+    const spy = vi.spyOn(CopilotClient.prototype, 'createSession').mockImplementation(async function(this: CopilotClient, config) {
+      const session = await original.call(this, config);
+      session.rpc.metadata.contextInfo = async () => {
+        if (mode === 'failed') throw new Error('Synthetic context metadata unavailable.');
+        return { contextInfo: null };
+      };
+      return session;
+    });
+    const endpoint = await provider(response => complete(response, 'metadata_unknown', message('Metadata is optional.'), 'Metadata is optional.'));
+    const f = fixture({ version: 3 });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' });
+    try {
+      const result = await app.submit('Complete without capacity metadata.');
+      expect(result.status, result.reason ?? '').toBe('completed');
+      expect(app.inspect().modelLimits.prompt).toEqual({ limit: null, used: null, source: 'unavailable' });
+      if (mode === 'failed') expect(app.store.events(app.id).some(event => event.data.state === 'context_unavailable' && event.data.diagnostic)).toBe(true);
+    } finally { await app.close(); spy.mockRestore(); await endpoint.close(); f.cleanup(); }
+  }, 30000);
+
+  it('allows verified uncapped answers with unknown billing across cold resume without converting uncertainty to zero', async () => {
+    const endpoint = await provider(response => complete(response, 'uncapped_no_usage', message('Synthetic answer with missing billing.'), 'Synthetic answer with missing billing.', false));
+    const f = fixture({ version: 3 });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    let app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' }); const id = app.id;
+    try {
+      const first = await app.submit('Complete an uncapped objective with missing billing.');
+      expect(first).toMatchObject({ status: 'completed', usage: { unknown: true, cost: null, requests: 1 } });
+      await app.close();
+      app = await V2Controller.open({ config, sessionId: id, apiKey: 'synthetic-provider-wire-key' });
+      expect(app.inspect().objective?.usage).toMatchObject({ unknown: true, cost: null });
+      const second = await app.submit('Start another objective without inventing prior billing.');
+      expect(second).toMatchObject({ status: 'completed', usage: { unknown: true, cost: null, requests: 1 } });
+      expect(endpoint.requests).toHaveLength(2);
+      expect(app.store.list('model', id, first.id)).toHaveLength(1);
+    } finally { await app.close(); await endpoint.close(); f.cleanup(); }
+  }, 30000);
+
+  it('restores deliberate prompt/output overrides on cold resume without adding a task budget', async () => {
+    const endpoint = await provider((response, _body, count) => complete(response, `explicit_${count}`, message('Explicit SDK limits retained.'), 'Explicit SDK limits retained.'));
+    const f = fixture({ version: 3 });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL, contextTokens: 48000, outputTokens: 1536 } });
+    let app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' }); const id = app.id;
+    try {
+      expect((await app.submit('Use explicit request settings.')).status).toBe('completed');
+      expect(app.inspect().modelLimits).toMatchObject({ prompt: { limit: 48000, source: 'explicit override' },
+        output: { limit: 1536, source: 'explicit override' } });
+      await app.close();
+      await expect(V2Controller.open({ config: parseV2Config({ ...config, model: { ...config.model, contextTokens: 64000 } }), sessionId: id }))
+        .rejects.toThrow('exact saved');
+      app = await V2Controller.open({ config, sessionId: id, apiKey: 'synthetic-provider-wire-key' });
+      expect((await app.submit('Retain the same explicit settings after restart.')).status).toBe('completed');
+      expect(app.inspect().modelLimits.prompt).toMatchObject({ limit: 48000, source: 'explicit override' });
+      expect(endpoint.requests).toHaveLength(2);
+      expect(endpoint.requests.every(request => request.max_output_tokens === 1536)).toBe(true);
+      expect(app.inspect().budget.mode).toBe('none');
+    } finally { await app.close(); await endpoint.close(); f.cleanup(); }
+  }, 60000);
+
+  it.each([
+    { maxTokens: 100000 },
+    { maxCost: 1, inputPerMillion: 1, outputPerMillion: 2 },
+  ])('refuses an explicit budget without a finite SDK output bound before provider dispatch: %j', async limits => {
+    const endpoint = await provider(response => complete(response, 'not_admitted', message('Unexpected dispatch.')));
+    const f = fixture({ version: 3, limits });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' });
+    try {
+      const result = await app.submit('Do not invent an output limit to enforce a budget.');
+      expect(result.status).toBe('failed');
+      expect(result.reason).toContain('finite request output bound');
+      expect(result.usage.requests).toBe(0);
+      expect(endpoint.requests).toHaveLength(0);
+    } finally { await app.close(); await endpoint.close(); f.cleanup(); }
+  }, 30000);
+
+  it('keeps operator verification ceilings outside product policy and refuses an exhausted verifier before dispatch', async () => {
+    const endpoint = await provider(response => complete(response, 'verified_default', message('Bounded verification only.'), 'Bounded verification only.'));
+    const f = fixture({ version: 3 });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    try {
+      for (const maxTokens of [100000, 128]) {
+        const verification = { maxTokens, outputTokens: 128 };
+        const app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key',
+          runtimeFactory: (resources, signal) => new CopilotRuntime(config, 'synthetic-provider-wire-key', resources, signal, verification) });
+        try {
+          const result = await app.submit('Exercise the separate operator spending guard.');
+          expect(result.status).toBe(maxTokens === 128 ? 'failed' : 'completed');
+          expect(app.inspect().budget).toEqual({ mode: 'none', maxTokens: null, maxCost: null });
+          expect(app.config.model.outputTokens).toBeUndefined();
+          expect(app.inspect().modelLimits).toMatchObject({ verification, output: { limit: null, source: 'SDK/provider default' } });
+          if (maxTokens !== 128) expect(app.store.list('model', app.id, result.id)[0]).toMatchObject({ budgetScope: 'verification' });
+          else expect(result.reason).toContain('Insufficient tokens');
+        } finally { await app.close(); }
+      }
+      expect(endpoint.requests).toHaveLength(1);
+      expect(endpoint.requests[0]?.max_output_tokens).toBe(128);
+      expect(config.limits.maxTokens).toBeUndefined();
+    } finally { await endpoint.close(); f.cleanup(); }
+  }, 60000);
+
   it('retrieves custom skills through the real runtime and observes a reload without reopening the session', async () => {
     const endpoint = await provider((response, _body, count) => count === 1 || count === 3
       ? complete(response, `resp_skill_${count}`, [{

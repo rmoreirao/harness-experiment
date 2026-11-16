@@ -124,8 +124,11 @@ export class ControlledModelTransport extends CopilotRequestHandler {
             }
             controller.enqueue(chunk.value);
           } catch (error) {
-            await reader.cancel(error); finish(errorText(error));
-            this.recordError(error, reservation?.id, true); controller.error(error);
+            try { await reader.cancel(error); }
+            finally {
+              finish(errorText(error));
+              this.recordError(error, reservation?.id, true); controller.error(error);
+            }
           }
         },
         cancel: async reason => { try { await reader.cancel(reason); } finally { finish('Model stream cancelled.'); } },
@@ -168,7 +171,8 @@ For a named site's latest-news overview, use the current homepage's source.evide
 Do not retype evidence, refetch the same page or seek unrelated confirmation when supplied headlines answer the request.
 One supported aggregate claim followed by one research_report is sufficient for a concise news overview.
 Observe browser state before acting. Supply exact expected HTTP requests for browser actions; submission and download are separate approvals.
-Idle does not imply completion. Do not claim completion with unresolved steps, unknown usage/effects or missing domain evidence.`;
+Idle does not imply completion. Do not claim completion with unresolved steps, pending requests, unknown external effects or missing domain evidence.
+Unknown billing usage is a warning without a task budget; explicitly configured budgets require reconciled accounting.`;
 
 function runtimeToolName(name: string): string {
   const prefixed = `harness_${name}`;
@@ -181,6 +185,7 @@ export class CopilotRuntime implements Runtime {
   private unsubscribe?: () => void;
   private context?: ModelLimits;
   private wireOutput?: number | null;
+  private readonly compactions = new Map<string, { settled: Promise<void>; resolve: () => void }>();
   constructor(private readonly config: V2Config, private readonly key: string, private readonly resources: Resources,
     private readonly signal: () => AbortSignal, private readonly verification?: VerificationBudget) {}
   async open(options: RuntimeOptions): Promise<void> {
@@ -261,6 +266,7 @@ export class CopilotRuntime implements Runtime {
               permissionDecisionReason: 'Only application-brokered, identified custom capabilities are admitted.' };
           },
           onAgentStop: async () => {
+            await this.drainCompaction();
             const reason = await options.beforeStop();
             return reason ? { decision: 'block', reason } : undefined;
           },
@@ -282,20 +288,59 @@ export class CopilotRuntime implements Runtime {
     else if (event.type === 'session.idle') options.emit('runtime', { state: 'idle' });
     else if (event.type === 'session.usage_info' && this.context) {
       this.context.prompt.used = event.data.currentTokens;
+      this.context.prompt.limit = event.data.tokenLimit;
+      this.context.prompt.source = this.config.model.contextTokens !== undefined ? 'explicit override' : 'runtime reported';
       this.publishContext();
+    }
+    else if (event.type === 'session.compaction_start') {
+      const id = event.data.compactionAttemptId ?? 'session';
+      if (!this.compactions.has(id)) {
+        let resolve!: () => void;
+        const settled = new Promise<void>(done => { resolve = done; });
+        this.compactions.set(id, { settled, resolve });
+      }
+      options.emit('runtime', { state: event.type, attemptId: id });
+    }
+    else if (event.type === 'session.compaction_summarized' || event.type === 'session.compaction_complete') {
+      const id = event.data.compactionAttemptId ?? 'session';
+      this.compactions.get(id)?.resolve(); this.compactions.delete(id);
+      options.emit('runtime', { state: event.type, attemptId: id, success: event.data.success,
+        error: event.data.error ?? null, failureReason: event.data.failureReason ?? null });
     }
     else if (event.type.includes('compaction')) options.emit('runtime', { state: event.type });
   }
   async send(prompt: string): Promise<void> {
     if (!this.session) throw new HarnessError('RUNTIME', 'Runtime is not open.');
     await this.session.sendAndWait({ prompt }, this.config.limits.timeoutMs);
+    await this.drainCompaction();
     await this.refreshContext();
+  }
+  private async drainCompaction(): Promise<void> {
+    if (!this.compactions.size) return;
+    const signal = this.signal(); signal.throwIfAborted();
+    let abort: (() => void) | undefined;
+    try {
+      await Promise.race([
+        Promise.all([...this.compactions.values()].map(compaction => compaction.settled)),
+        new Promise<never>((_resolve, reject) => {
+          abort = () => reject(signal.reason);
+          signal.addEventListener('abort', abort, { once: true });
+        }),
+      ]);
+    } finally { if (abort) signal.removeEventListener('abort', abort); }
   }
   private async refreshContext(): Promise<void> {
     if (!this.session) return;
-    const info = (await this.session.rpc.metadata.contextInfo({
-      promptTokenLimit: 0, outputTokenLimit: 0, resolveOutputTokenLimit: false,
-    })).contextInfo;
+    const metadata = this.session.rpc.metadata;
+    let info: Awaited<ReturnType<typeof metadata.contextInfo>>['contextInfo'] = null;
+    try {
+      info = (await metadata.contextInfo({
+        promptTokenLimit: 0, outputTokenLimit: 0, resolveOutputTokenLimit: false,
+      })).contextInfo;
+    } catch (error) {
+      this.options?.emit('runtime', { state: 'context_unavailable',
+        diagnostic: errorDiagnostic(error, this.resources.store.redactor, { source: 'runtime', operation: 'context metadata' }) });
+    }
     this.context = {
       model: this.config.model.canonical, providerCapacityVerified: false,
       prompt: {
@@ -336,6 +381,8 @@ export class CopilotRuntime implements Runtime {
       try { failures.push(...await this.client.stop()); this.client = undefined; }
       catch (error) { failures.push(error); }
     }
+    for (const compaction of this.compactions.values()) compaction.resolve();
+    this.compactions.clear();
     if (failures.length) throw new AggregateError(failures, 'Owned Copilot runtime did not stop cleanly.');
   }
 }
