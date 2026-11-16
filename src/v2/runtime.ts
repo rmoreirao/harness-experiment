@@ -142,6 +142,9 @@ Execution uses a filtered no-network mirror; inspect and publish exact approved 
 Use result_read to revisit evidence instead of repeating external actions. Capture genuine verification evidence.
 Use work_inspect to diagnose recent failed actions, including earlier objectives, without retrying their external effects.
 Research claims need exact retrieved quotes, conflicts and honest uncertainty; reports use [source:ID] citations.
+For a named site's latest-news overview, use the current homepage's source.evidence headline IDs.
+Do not retype evidence, refetch the same page or seek unrelated confirmation when supplied headlines answer the request.
+One supported aggregate claim followed by one research_report is sufficient for a concise news overview.
 Observe browser state before acting. Supply exact expected HTTP requests for browser actions; submission and download are separate approvals.
 Idle does not imply completion. Do not claim completion with unresolved steps, unknown usage/effects or missing domain evidence.`;
 

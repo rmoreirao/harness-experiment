@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { describe, it, expect } from 'vitest';
 import { V2Controller } from '../../src/v2/controller.js';
 import { ProtectedNetwork, publicAddress } from '../../src/v2/network.js';
+import { readable } from '../../src/v2/research.js';
 import { parseV2Config } from '../../src/v2/config.js';
 import { fixture, ScriptRuntime, approve } from './helpers.js';
 import type { Source } from '../../src/v2/contracts.js';
@@ -13,6 +14,13 @@ async function site() {
     if (request.url === '/loop') { response.writeHead(302, { Location: '/loop' }).end(); return; }
     if (request.url === '/large') { response.writeHead(200, { 'Content-Type': 'text/plain' }).end('a'.repeat(10000)); return; }
     if (request.url === '/missing') { response.writeHead(404).end('Unavailable'); return; }
+    if (request.url === '/headlines') {
+      response.writeHead(200, { 'Content-Type': 'text/html' }).end(`<title>Fixture news &amp; evidence</title>
+        <main><h2><a href="/noticia/cashback">Reforma tributária: &#x27;cashback&#39; começa em janeiro</a></h2>
+        <h2><a href="/noticia/regulation">Entenda a regulação de redes sociais</a></h2>
+        <p>Entenda a regulação de redes sociais <span>Há 3 minutos Tecnologia</span></p></main>`);
+      return;
+    }
     if (request.url === '/large-readable' || request.url === '/declared-large') {
       const body = `<title>Large news portal fixture</title><!--${'x'.repeat(2650000)}--><main><h2>Latest synthetic headline</h2><p>Verified fixture news content.</p></main>`;
       response.writeHead(200, { 'Content-Type': 'text/html', ...(request.url === '/declared-large' ? { 'Content-Length': Buffer.byteLength(body) } : {}) }).end(body);
@@ -28,6 +36,78 @@ async function site() {
   return { ipv4, ipv6, close: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); } };
 }
 describe('V2 A03/A06 protected retrieval and evidence', () => {
+  it('decodes HTML5 numeric/named entities once without executing encoded content', () => {
+    const result = readable(Buffer.from('<title>A &amp; B</title><p>&#x27;cashback&#39; &#8364; &#x1F30D; &amp;#x27;</p><script>untrusted-script</script>'), 'text/html');
+    expect(result.title).toBe('A & B');
+    expect(result.text).toContain("'cashback' \u20ac \ud83c\udf0d &#x27;");
+    expect(result.text).not.toContain('untrusted-script');
+  });
+
+  it('canonicalizes formatting-only quote differences and uses exact source-bound headline evidence IDs', async () => {
+    const website = await site();
+    const f = fixture({ network: { localFixtureOrigins: [website.ipv4] } });
+    const runtime = new ScriptRuntime(async runtime => {
+      const fetched = await runtime.call('web_fetch', { url: website.ipv4 + '/headlines' });
+      const source = fetched.source as Source;
+      expect(source.evidence).toHaveLength(2);
+      expect(source.evidence![0]!.quote).toBe("Reforma tributária: 'cashback' começa em janeiro");
+      expect(source.evidence![0]!.url).toBe(website.ipv4 + '/noticia/cashback');
+      const quote = 'Entenda a regulação de redes sociais\nHá 3 minutos Tecnologia';
+      await runtime.call('research_claim', { text: 'A homepage lists recent synthetic regulation coverage.',
+        support: [{ sourceId: source.id, quote: quote.replaceAll('\n', '\\n') }] });
+      const stored = app.store.list('claim', app.id, app.inspect().objective!.id)[0]!;
+      const content = app.store.readResult(app.id, source.resultId).text;
+      expect(content).toContain(stored.support[0]!.quote);
+      expect(stored.support[0]!.quote).not.toContain('\\n');
+      await expect(runtime.call('research_claim', { text: 'Changed fixture time', support: [{ sourceId: source.id, quote: quote.replace('3 minutos', '9 minutos') }] })).rejects.toThrow('retrieved words');
+      await expect(runtime.call('research_claim', { text: 'Invented evidence', support: [{ sourceId: source.id, evidenceId: '0'.repeat(24) }] })).rejects.toThrow('evidence ID');
+      await runtime.call('research_claim', { text: 'The homepage announces synthetic cashback news.',
+        support: [{ sourceId: source.id, evidenceId: source.evidence![0]!.id }] });
+      const claim = app.store.list('claim', app.id, app.inspect().objective!.id)[1]!;
+      expect(content).toContain(claim.support[0]!.quote);
+      expect(claim.support[0]!.evidenceId).toBe(source.evidence![0]!.id);
+      const report = `A homepage lists recent synthetic regulation coverage. [source:${source.id}]
+The homepage announces synthetic cashback news. [source:${source.id}]`;
+      await runtime.call('research_report', { report });
+      const result = app.inspect().results.find(result => result.provenance.kind === 'research_report')!;
+      await runtime.call('work_plan', { steps: [{ id: 'headlines', title: 'Verify homepage headlines', expected: 'A report supported by exact source evidence',
+        status: 'done', results: [result.id] }] });
+      runtime.message(report);
+    });
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime }); approve(app);
+    try { expect((await app.submit('Summarize the latest fixture headlines.', { domain: 'research' })).status).toBe('completed'); }
+    finally { await app.close(); await website.close(); f.cleanup(); }
+  });
+
+  it('renders registered evidence and uncertainty without repeated draft-wording failures and exposes the correct plan result ID', async () => {
+    const website = await site();
+    const f = fixture({ network: { localFixtureOrigins: [website.ipv4] } });
+    const runtime = new ScriptRuntime(async runtime => {
+      const fetched = await runtime.call('web_fetch', { url: website.ipv4 + '/headlines' });
+      const source = fetched.source as Source;
+      const claim = await runtime.call('research_claim', {
+        text: 'The homepage highlights the synthetic cashback announcement.',
+        uncertainty: 'Only the homepage was retrieved; the article was not opened.',
+        support: [{ sourceId: source.id, evidenceId: source.evidence![0]!.id }],
+      });
+      const report = await runtime.call('research_report', { report: `A concise fixture news overview. [source:${source.id}]` });
+      expect(report.canonicalEvidenceAppended).toBe(true);
+      const id = String(report.planResultId);
+      const text = app.store.readResult(app.id, id).text;
+      expect(text).toContain(String(claim.text));
+      expect(text).toContain(String(claim.uncertainty));
+      expect(text).toContain(`[source:${source.id}]`);
+      await expect(runtime.call('work_plan', { steps: [{ id: 'report', title: 'Record report evidence', expected: 'A verified report',
+        status: 'done', results: [claim.id] }] })).rejects.toThrow('not a claim/source ID');
+      await runtime.call('work_plan', { steps: [{ id: 'report', title: 'Record report evidence', expected: 'A verified report',
+        status: 'done', results: [id] }] });
+      runtime.message('The fixture overview has canonical source evidence and visible uncertainty.');
+    });
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime }); approve(app);
+    try { expect((await app.submit('Produce a concise cited fixture overview.', { domain: 'research' })).status).toBe('completed'); }
+    finally { await app.close(); await website.close(); f.cleanup(); }
+  });
+
   it('retrieves readable news evidence from a bounded multi-megabyte HTML page while rejecting it under a smaller configured cap', async () => {
     const website = await site();
     const small = fixture({ network: { localFixtureOrigins: [website.ipv4], maxBytes: 1048576 } });

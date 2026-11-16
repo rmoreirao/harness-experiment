@@ -276,10 +276,12 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
     this.broker.register('work_inspect', 'Inspect the original objective, plan, limits, result IDs and ten recent failed actions in this session, including earlier objectives. Use this to explain prior errors without repeating their actions.', z.object({}).strict(), 'internal',
       () => ({ objective: this.resources.current(), results: this.store.list('result', this.id, this.currentId),
         recentErrors: this.store.recentActionErrors(this.id) }));
-    this.broker.register('work_plan', 'Update the runtime-owned plan and its product evidence projection. Dependencies must be valid and done steps reference real results.', z.object({
+    this.broker.register('work_plan', 'Update the runtime-owned plan and product evidence. Done steps need real result IDs: use research_report.planResultId, another tool result.id, or source.resultId. Claim IDs and source IDs are not result IDs. Dependencies must be valid.', z.object({
       steps: z.array(stepSchema).min(1).max(50),
     }).strict(), 'internal', async args => {
       const ids = new Set(args.steps.map(step => step.id));
+      const results = this.store.list('result', this.id, this.currentId);
+      const resultIds = new Set(results.map(result => result.id));
       if (ids.size !== args.steps.length) throw new HarnessError('PLAN', 'Duplicate step identity.');
       const visit = (id: string, ancestors: Set<string>) => {
         if (ancestors.has(id)) throw new HarnessError('PLAN', 'Cyclic step dependency.');
@@ -289,7 +291,9 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
       };
       for (const step of args.steps) {
         visit(step.id, new Set());
-        for (const id of step.results) if (this.store.get('result', id, this.id).objectiveId !== this.currentId) throw new HarnessError('PLAN', 'Evidence belongs to another objective.');
+        for (const id of step.results) if (!resultIds.has(id)) {
+          throw new HarnessError('PLAN', `Invalid evidence result ID ${id}. Use a current result ID, not a claim/source ID. Recent results: ${results.slice(-5).map(result => `${result.id} (${String(result.provenance.kind ?? result.provenance.tool ?? 'output')})`).join(', ')}`);
+        }
         if (step.status === 'done' && (!step.results.length || step.dependencies.some(id => args.steps.find(item => item.id === id)?.status !== 'done'))) {
           throw new HarnessError('PLAN', 'Done steps need evidence and completed prerequisites.');
         }

@@ -14,6 +14,10 @@ Review the resulting diff. Reference actual command output/result IDs and disclo
   research: `Search only through the configured connector; no snippets count as retrieved evidence.
 Retrieve primary sources where available. Record exact supporting quotes and retrieval times.
 Compare independent origins; repeated pages from the same origin do not provide independent confirmation.
+For latest news on a named site, fetch its current homepage once and use its supplied headline evidence.
+Prefer sourceId/evidenceId references instead of retyping quotes or reading full pages repeatedly.
+A concise overview can use one aggregate claim with its selected headline references, then one verified report.
+Additional sources or full article retrievals are for requested depth or missing evidence, not a mandatory source count.
 Record contradictory evidence and uncertainty. Use research_report and [source:ID] citations.
 State missing search credentials or unavailable sources explicitly. Never invent retrievals.`,
   browser: `Use a clean session browser and observe accessibility state before each action.

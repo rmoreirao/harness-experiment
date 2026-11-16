@@ -189,7 +189,7 @@ The SDK cases run the actual bundled native runtime, not the MVP OpenAI backend.
 
 | Scenario | Implemented evidence | Remaining release evidence |
 |---|---|---|
-| A01 | `test\v2\runtime.test.ts`: real SDK/BYOK protocol, streaming, custom tool approval/denial, cold callback restoration, fixed deployment identity, usage and secret-free journals. `resources.test.ts`: admission before network and unknown-usage recovery. | The user's selected live endpoint/model and real invalid-credential behavior are not exercised without an authorized budget. Real production-context auxiliary/compaction behavior remains to be demonstrated. |
+| A01 | `test\v2\runtime.test.ts`: real SDK/BYOK protocol, streaming, custom tool approval/denial, cold callback restoration, fixed deployment identity, usage and secret-free journals. `resources.test.ts`: admission before network and unknown-usage recovery. One exact Globo news request completed on the configured live `gpt-6-luna` endpoint within 100,000 tokens. | Live invalid-credential/negative-provider cases and production-context auxiliary/compaction behavior remain to be demonstrated. |
 | A02 | `providers.test.ts`: genuine failing shell-source arithmetic check, focused patch, genuine passing Docker check, diff inspection, host-conflict rejection, approved selected publication and preservation of unrelated edits. `core.test.ts`: precise/stale/protected/binary/link cases and completion cannot bypass domain checks. | Broader toolchains and representative live-model coding quality remain unverified. Native Windows toolchains are unsupported, not run on the host. |
 | A03 | `research.test.ts`: three retrieved sources, two independent network hosts, duplicate-origin detection, conflicting quotes, resolvable report, explicit uncertainty, failed retrieval, redirects/private addresses/body caps and false citation rejection. `integrations.test.ts`: mocked Brave connector contract and pre-dispatch charge admission. | No live Brave account/query or paid search charge validation. Structural citations are not universal fact checking. |
 | A04 | `providers.test.ts`: real installed Chromium 156.0.8078.4 with Playwright Core 1.65.0, observation-bound typing/clicks, denied POST with zero effects, approved POST, stale observation rejection, screenshot/quarantined-download provenance, retained same-session cookies and clean second-session cookies. | Personal/enterprise authentication, uploads, scripts and JavaScript sites remain disabled. Physical browser/terminal observations not covered by the fixture are not claimed. |
@@ -220,11 +220,11 @@ The original workspace package archive is not overwritten. Final observations:
 | `git -c core.whitespace=cr-at-eol diff --check` | PASS. Existing tracked source/docs use CRLF; their convention was preserved, not converted wholesale. |
 | Owned Docker-container cleanup | No `harness-v2-*` containers remained after timeout/output-overflow and acceptance checks. |
 | Installable archive | `harness-experiment-0.1.0.tgz` in this session's artifacts, separate from the pre-existing workspace archive. |
-| Live model/search and physical clipboard/font checks | NOT RUN / NOT OBSERVED; not counted as passing acceptance. |
+| Live model/search and physical clipboard/font checks | The configured live model completed the exact Globo news request on 2026-11-15; live search and physical clipboard/font checks remain NOT RUN / NOT OBSERVED. |
 
 **Release gate: blocked.** A runnable and validated preview is available, but
-V2-01 through V2-16 are not all release-accepted. Live endpoint/search verification
-needs explicit destinations/credentials/budgets; native clipboard/font checks
+V2-01 through V2-16 are not all release-accepted. Remaining live endpoint/search
+cases need explicit destinations/credentials/budgets; native clipboard/font checks
 need observation; hard execution disk quotas need a separately proved provider
 boundary rather than a claim about a Docker bind mount. Keep the MVP default.
 
@@ -306,3 +306,39 @@ unchanged token-cap enforcement, changed-frame/prefix/interaction rejection,
 restart persistence, no copied prompt text, overshoot recovery and one-attempt
 quota refusal. A synthetic endpoint also verified this path using the user's
 canonical `gpt-6-luna` model identity. No paid model calls were made for the fix.
+
+### 2026-11-15: exact Globo request completed end to end
+
+Session-log investigation of `error-683` and `error-697` showed correct source
+ownership but invalid representation matching: the HTML extractor retained
+`&#x27;`, and quote matching rejected newline/escaped-newline formatting. The
+HTML5 decoder is now pinned as `entities` 9.0.0; claims resolve formatting-only
+differences to exact stored source spans. Changed words/dates still fail.
+Homepage fetches return bounded headline evidence IDs and article links so the
+model can select evidence rather than retyping it or reading full pages again.
+Research guidance makes clear that a concise named-site overview does not
+require unrelated sources or article-depth retrieval.
+
+A guarded live verification processed the exact prompt
+`what are latest news on globo.com?` with the configured `gpt-6-luna` model.
+Outcome: **completed**, one verified report, three supported headline records,
+78,437 input + 2,053 output = **80,490 tokens**, zero unknown/reserved usage, and
+the original **100,000-token ceiling unchanged**. Verification ran in an empty
+workspace and only approved public Globo retrievals. The answer, summary,
+source/claim/result evidence and private runtime state are retained under this
+session's `files\news-verification\globo-live-KDTSB4` artifacts.
+
+The successful trace exposed two avoidable report-wording/uncertainty retries
+and one mistaken plan result ID. Reports now explicitly render canonical
+recorded evidence/limitations when a draft omits their exact wording and return
+a flat `planResultId`; unknown citations still fail. Plan diagnostics identify
+valid current result IDs rather than returning a generic missing-record error.
+The exact two failed report drafts from the live trace both validate under the
+corrected renderer when replayed without additional model calls.
+
+Final static checks passed. The current V2 regression selection passed
+**68 tests in eleven files**, including configured local Docker/browser cases,
+numeric entities, canonical whitespace, evidence IDs, report/uncertainty
+assembly, unchanged token caps and explicit live-verification authority guards.
+`test\v2\news-live-check.ts` / `verify:v2:news` retain an opt-in, bounded exact-goal
+verifier; ordinary tests never spend against the live provider.

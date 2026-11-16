@@ -73,12 +73,13 @@ export interface Source {
   url: string; finalUrl: string; origin: string; title: string;
   retrieved: number; published: string | null;
   hash: string; resultId: string; extraction: string;
+  evidence?: { id: string; quote: string; start: number; end: number; url: string | null }[];
 }
 export interface Claim {
   id: string; sessionId: string; objectiveId: string;
   text: string; inference: boolean; uncertainty: string | null;
-  support: { sourceId: string; quote: string }[];
-  conflicts: { sourceId: string; quote: string }[];
+  support: { sourceId: string; quote: string; evidenceId?: string }[];
+  conflicts: { sourceId: string; quote: string; evidenceId?: string }[];
 }
 export interface ModelRequest {
   id: string; sessionId: string; objectiveId: string;
