@@ -11,6 +11,58 @@ import { HarnessError } from '../../src/contracts.js';
 import { CopilotRuntime } from '../../src/v2/runtime.js';
 
 describe('V2 A01 real pinned Copilot SDK/runtime over synthetic Responses', () => {
+  it('starts an isolated SDK conversation after clear and cold resume without replaying prior prompts, answers or tool results', async () => {
+    const oldPrompt = 'OLD_CONTEXT_USER_96b13';
+    const oldAnswer = 'OLD_CONTEXT_ASSISTANT_96b13';
+    const oldTool = 'OLD_CONTEXT_TOOL_RESULT_96b13';
+    const endpoint = await provider((response, _body, count) => count === 1
+      ? complete(response, 'before_clear_tool', [{ id: 'old_context_tool', call_id: 'old_context_tool',
+        type: 'function_call', name: 'harness_fixture_context', arguments: '{}', status: 'completed' }])
+      : complete(response, `clear_answer_${count}`, message(count === 2 ? oldAnswer : 'Fresh answer.'),
+        count === 2 ? oldAnswer : 'Fresh answer.'));
+    const f = fixture({ version: 3 });
+    const config = parseV2Config({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    let app = await V2Controller.open({ config, apiKey: 'synthetic-provider-wire-key' });
+    const id = app.id;
+    app.broker.register('fixture_context', 'Return synthetic evidence.', z.object({}).strict(), 'internal', () => ({ text: oldTool }));
+    try {
+      const old = await app.submit(oldPrompt);
+      expect(old.status, old.reason ?? '').toBe('completed');
+      expect(JSON.stringify(endpoint.requests[1])).toContain(oldTool);
+      const oldResults = app.store.list('result', id, old.id);
+      const previousRuntime = app.runtimeId;
+      const stop = vi.spyOn(CopilotClient.prototype, 'stop').mockResolvedValueOnce([new Error('Injected child shutdown failure.')]);
+      await expect(app.clearContext()).rejects.toThrow('did not stop cleanly');
+      expect(app.runtimeId).toBe(previousRuntime);
+      await expect(app.submit('Blocked until reset succeeds.')).rejects.toThrow('Retry /clear');
+      await app.clearContext();
+      expect(stop).toHaveBeenCalledTimes(2);
+      stop.mockRestore();
+      const freshRuntime = app.runtimeId;
+      expect(freshRuntime).not.toBe(previousRuntime);
+      expect(endpoint.requests).toHaveLength(2);
+      await app.close();
+      app = await V2Controller.open({ config, sessionId: id, apiKey: 'synthetic-provider-wire-key' });
+      expect(app.inspect().objective).toBeUndefined();
+      const fresh = await app.submit('NEW_CONTEXT_USER_96b13');
+      expect(fresh.status, fresh.reason ?? '').toBe('completed');
+      const request = JSON.stringify(endpoint.requests[2]);
+      expect(request).toContain('NEW_CONTEXT_USER_96b13');
+      expect(request).toContain('Use only the supplied controlled capabilities');
+      for (const previous of [oldPrompt, oldAnswer, oldTool, old.id]) expect(request).not.toContain(previous);
+      expect(app.runtimeId).toBe(freshRuntime);
+      expect(app.store.get('objective', old.id, id)).toEqual(old);
+      expect(app.store.list('result', id, old.id)).toEqual(oldResults);
+      await app.close();
+      app = await V2Controller.open({ config, sessionId: id, apiKey: 'synthetic-provider-wire-key' });
+      const resumed = await app.submit('Resume only the fresh context.');
+      expect(resumed.status, resumed.reason ?? '').toBe('completed');
+      const resumedRequest = JSON.stringify(endpoint.requests[3]);
+      expect(resumedRequest).toContain('NEW_CONTEXT_USER_96b13');
+      for (const previous of [oldPrompt, oldAnswer, oldTool]) expect(resumedRequest).not.toContain(previous);
+    } finally { await app.close(); await endpoint.close(); f.cleanup(); }
+  }, 60000);
+
   it('uses SDK defaults and finishes a real tool turn above 100,000 cumulative reported tokens without reservations', async () => {
     const text = 'SDK-owned context and uncapped cumulative usage verified.';
     const usage = { input_tokens: 40000, output_tokens: 2000, total_tokens: 42000 };
@@ -79,6 +131,14 @@ describe('V2 A01 real pinned Copilot SDK/runtime over synthetic Responses', () =
       expect(app.store.get('objective', first.id, id)).toEqual(first);
       expect(app.store.list('model', id, first.id)).toEqual(records);
       expect(app.inspect().modelLimits.prompt.source).toBe('runtime reported');
+      await app.clearContext();
+      const requestCount = endpoint.requests.length;
+      const fresh = await app.submit('Fresh context after native compaction.');
+      expect(fresh.status, fresh.reason ?? '').toBe('completed');
+      const freshRequests = JSON.stringify(endpoint.requests.slice(requestCount));
+      expect(freshRequests).not.toContain('Synthetic summary:');
+      expect(freshRequests).not.toContain(first.original);
+      expect(freshRequests).not.toContain(second.original);
     } finally { await app.close(); await endpoint.close(); f.cleanup(); }
   }, 60000);
 

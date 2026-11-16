@@ -378,7 +378,11 @@ export class CopilotRuntime implements Runtime {
     try { await this.session?.disconnect(); } catch (error) { failures.push(error); }
     this.session = undefined;
     if (this.client) {
-      try { failures.push(...await this.client.stop()); this.client = undefined; }
+      try {
+        const errors = await this.client.stop();
+        failures.push(...errors);
+        if (!errors.length) this.client = undefined;
+      }
       catch (error) { failures.push(error); }
     }
     for (const compaction of this.compactions.values()) compaction.resolve();

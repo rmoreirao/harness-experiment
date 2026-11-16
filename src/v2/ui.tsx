@@ -7,7 +7,8 @@ import { errorDiagnostic, errorInspector, errorNotice } from '../errors.js';
 import type { Objective } from './contracts.js';
 import type { V2Controller } from './controller.js';
 
-export const V2_HELP = `/status /plan /request /back /cancel /continue /exit
+export const V2_HELP = `/status /plan /request /back /cancel /continue /clear /exit
+/clear resets model context, conversation and input history while idle; saved evidence and settings remain.
 /approve or /reject decides the displayed current action only.
 /approve_all approves all pending and future tool calls in this session, including after resume.
 /approve_all off restores per-call approvals. Questions and safety restrictions still apply.
@@ -27,7 +28,7 @@ export function V2TerminalApp({ controller, domain = 'general', criteria = [] }:
   const { exit } = useApp(); const { stdin, setRawMode } = useStdin(); const { stdout } = useStdout();
   const [dimensions, setDimensions] = useState({ width: stdout.columns ?? 100, height: stdout.rows ?? 30 });
   const [, refresh] = useState(0);
-  const [editor, setEditor] = useState(() => emptyEditor(controller.store.list('objective', controller.id).map(objective => objective.original)));
+  const [editor, setEditor] = useState(() => emptyEditor(controller.store.conversationObjectives(controller.id).map(objective => objective.original)));
   const editorRef = useRef(editor); editorRef.current = editor;
   const [inspector, setInspector] = useState<string | null>(null);
   const [offset, setOffset] = useState(0);
@@ -56,6 +57,7 @@ export function V2TerminalApp({ controller, domain = 'general', criteria = [] }:
     const state = controller.inspect(); const pending = state.pending[0];
     if (input === '/exit') { setStopping(true); await controller.close(); exit(); return; }
     if (input === '/cancel') { launch(controller.cancel(), '/cancel'); return; }
+    if (input === '/clear') { await controller.clearContext(); return; }
     if (input === '/help') { setInspector(V2_HELP); setOffset(0); return; }
     if (input === '/status') { setInspector(JSON.stringify(state, null, 2)); setOffset(0); return; }
     const errors = errorInspector(input, controller.store, controller.id);
@@ -124,6 +126,11 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
     setLive(''); launch(controller.submit(input, { domain, criteria }), 'submit'); refresh(value => value + 1);
   };
   useEffect(() => controller.subscribe(event => {
+    if (event.type === 'runtime' && event.data.state === 'context_cleared') {
+      editorRef.current = emptyEditor(); setEditor(editorRef.current);
+      setInspector(null); setOffset(0); setLive('');
+      setNotice('Context cleared. Saved evidence, files and session settings are unchanged.');
+    }
     if (event.type === 'text' && typeof event.data.delta === 'string') setLive(value => value + event.data.delta);
     if (event.type === 'text' && typeof event.data.message === 'string') setLive('');
     if (event.type === 'error') setNotice(errorNotice(event.data));
@@ -166,7 +173,7 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
   }, [controller, stdin, stdout, setRawMode]);
   if (stopping) return <Text>Stopping owned work and saving V2 state...</Text>;
   const state = controller.inspect(); const objective = state.objective; const pending = state.pending[0];
-  const transcript = controller.store.list('objective', controller.id).flatMap(objective => [
+  const transcript = controller.store.conversationObjectives(controller.id).flatMap(objective => [
     `YOU  ${objective.original}`, ...(objective.output ? [`ASSISTANT  ${objective.output}`] : []),
   ]);
   const width = Math.max(16, dimensions.width - 4);

@@ -12,6 +12,9 @@ The MVP command and historical data remain unchanged. V2 is not release-accepted
 and is not the default.
 V2 loads workspace skills from `.github\skills\<name>\SKILL.md` at startup;
 use `/skills list` and `/skills reload` to inspect and refresh the loaded set.
+V2's `/clear` starts a fresh model context and clears the terminal conversation
+and input history while idle. Saved evidence, workspace files and session
+settings remain; cancel active work and reconcile unresolved effects first.
 In V2, `/approve_all` approves every pending and future tool call for the session,
 including after resume; `/approve_all off` restores per-call approvals.
 Questions and capability/safety restrictions remain in force.

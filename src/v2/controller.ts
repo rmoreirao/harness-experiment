@@ -30,7 +30,8 @@ export interface V2OpenOptions {
 const activeStatuses = ['preparing', 'running', 'awaiting_approval', 'awaiting_input', 'recovery_required'];
 export class V2Controller {
   readonly id: string;
-  readonly runtimeId: string;
+  private runtimeIdentity: string;
+  get runtimeId(): string { return this.runtimeIdentity; }
   readonly store: V2Store;
   readonly config: V2Config;
   readonly broker: ActionBroker;
@@ -46,6 +47,8 @@ export class V2Controller {
   private aborter = new AbortController();
   private job?: Promise<Objective>;
   private closing?: Promise<void>;
+  private clearing?: Promise<void>;
+  private resetFailed = false;
   private closed = false;
   private runtimeOpen = false;
   private runtimeCreated = false;
@@ -53,7 +56,7 @@ export class V2Controller {
   private modelLimits?: ModelLimits;
   private constructor(options: V2OpenOptions, store: V2Store, owner: Ownership, id: string) {
     this.store = store; this.owner = owner; this.id = id;
-    const session = store.session(id); this.runtimeId = session.runtimeId;
+    const session = store.session(id); this.runtimeIdentity = session.runtimeId;
     this.config = parseV2Config(session.config);
     this.skills = new Skills(this.config);
     this.resources = new Resources(store, this.config, id, () => {
@@ -73,9 +76,11 @@ export class V2Controller {
       new CopilotRuntime(this.config, key, this.resources, () => this.aborter.signal);
     this.registerStateTools();
     this.broker.tools();
-    this.runtimeCreated = Boolean(store.db.prepare<[string], { found: number }>(
-      "SELECT 1 AS found FROM events WHERE session_id=? AND type='runtime' AND json_extract(data,'$.state')='creating' LIMIT 1").get(id));
-    const objective = store.latest(id);
+    this.runtimeCreated = Boolean(store.db.prepare<[string, string], { found: number }>(
+      `SELECT 1 AS found FROM events WHERE session_id=? AND type='runtime' AND json_extract(data,'$.state')='creating'
+       AND seq>COALESCE((SELECT MAX(seq) FROM events WHERE session_id=? AND type='runtime'
+         AND json_extract(data,'$.state')='context_cleared'),0) LIMIT 1`).get(id, id));
+    const objective = store.conversationObjectives(id).at(-1);
     if (objective) {
       this.currentId = objective.id;
       if (activeStatuses.includes(objective.status)) {
@@ -130,7 +135,7 @@ export class V2Controller {
     const actions = objective ? this.store.list('action', this.id, objective.id) : [];
     return {
       sessionId: this.id, runtimeId: this.runtimeId, model: this.config.model.canonical, workspace: this.config.workspace,
-      objective, busy: Boolean(this.job), readOnly: this.config.readOnly, approveAll: this.broker.approveAll,
+      objective, busy: Boolean(this.job || this.clearing), readOnly: this.config.readOnly, approveAll: this.broker.approveAll,
       pending: objective ? this.store.list('decision', this.id, objective.id).filter(decision => decision.status === 'pending') : [],
       actions, verificationDomains: objective ? this.verificationDomains(objective, actions) : ['general'],
       recentErrors: this.store.recentActionErrors(this.id),
@@ -155,7 +160,7 @@ export class V2Controller {
   }
   reloadSkills() {
     this.owner.assert();
-    if (this.closed || this.closing || this.job || (this.currentId && activeStatuses.includes(this.resources.current().status))) {
+    if (this.closed || this.closing || this.job || this.clearing || this.resetFailed || (this.currentId && activeStatuses.includes(this.resources.current().status))) {
       throw new HarnessError('BUSY', 'Skills can only be reloaded while idle. Cancel or finish the current objective first.');
     }
     this.skills.reload();
@@ -165,9 +170,10 @@ export class V2Controller {
   }
   async submit(original: string, options: { domain?: Objective['domain']; criteria?: string[] } = {}): Promise<Objective> {
     this.owner.assert();
-    if (this.closed || this.closing || this.job || (this.currentId && activeStatuses.includes(this.resources.current().status))) {
+    if (this.closed || this.closing || this.job || this.clearing || (this.currentId && activeStatuses.includes(this.resources.current().status))) {
       throw new HarnessError('BUSY', 'One objective is already admitted, including preparation, pending decisions and recovery.');
     }
+    if (this.resetFailed) throw new HarnessError('CONTEXT', 'Context reset failed. Retry /clear before submitting work.');
     const goal = z.string().trim().min(1).max(100000).parse(original);
     const criteria = z.array(z.string().min(1).max(2000)).max(30).parse(options.criteria ?? []);
     const objective: Objective = {
@@ -197,7 +203,9 @@ export class V2Controller {
         const resume = this.runtimeCreated;
         this.runtimeCreated = true; this.emit('runtime', { state: 'creating', resume });
         await this.runtime.open({
-          sessionId: this.runtimeId, resume, directory: path.join(this.config.dataDir, 'runtime', this.id),
+          sessionId: this.runtimeId, resume, directory: this.store.list('conversation', this.id).length
+            ? path.join(this.config.dataDir, 'runtime', this.id, this.runtimeId)
+            : path.join(this.config.dataDir, 'runtime', this.id),
           tools: this.broker.tools(), signal: this.aborter.signal, emit: (type, data) => this.emit(type, data),
           onContext: limits => { this.modelLimits = limits; },
           question: (question, choices, allowFreeform) => this.broker.question(question, choices, allowFreeform),
@@ -397,11 +405,35 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
     })();
   }
   async continueObjective(): Promise<Objective> {
-    if (this.job || this.closing || this.closed) throw new HarnessError('BUSY', 'Work is active or closing.');
+    if (this.job || this.clearing || this.closing || this.closed) throw new HarnessError('BUSY', 'Work is active or closing.');
+    if (this.resetFailed) throw new HarnessError('CONTEXT', 'Context reset failed. Retry /clear before continuing work.');
     const current = this.resources.current();
     if (current.status !== 'partial') throw new HarnessError('CONTINUATION', 'Only explicitly reconciled/partial objectives can continue.');
     current.status = 'preparing'; this.store.put('objective', current);
     return this.start(`Continue the same original objective without resetting budgets or scope: ${current.original}`);
+  }
+  async clearContext(): Promise<void> {
+    this.owner.assert();
+    if (this.closed || this.closing || this.job || this.clearing ||
+        (this.currentId && (activeStatuses.includes(this.resources.current().status) || this.unknownEffects())) ||
+        this.store.list('decision', this.id).some(decision => decision.status === 'pending')) {
+      throw new HarnessError('BUSY', 'Context can only be cleared while idle. Cancel or finish work and reconcile unresolved effects first.');
+    }
+    const work = Promise.resolve().then(async () => {
+      this.resetFailed = true;
+      this.runtimeOpen = false;
+      await this.runtime.close();
+      const { session, event } = this.store.clearContext(this.id);
+      this.runtimeIdentity = session.runtimeId;
+      this.currentId = '';
+      this.runtimeCreated = false;
+      this.modelLimits = undefined;
+      this.runtimeError = null;
+      this.resetFailed = false;
+      for (const listener of this.listeners) listener(event);
+    });
+    this.clearing = work;
+    try { await work; } finally { this.clearing = undefined; }
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;
@@ -409,6 +441,12 @@ ${current.domain === 'general' ? '' : `Reviewed ${current.domain} workflow:\n${r
   }
   private async shutdown(): Promise<void> {
     if (this.closed) return;
+    if (this.clearing) {
+      try { await this.clearing; }
+      catch (error) {
+        this.emit('error', errorDiagnostic(error, this.store.redactor, { operation: 'context reset during shutdown' }));
+      }
+    }
     const interrupted = this.currentId && (Boolean(this.job) || activeStatuses.includes(this.resources.current().status));
     await this.cancel();
     await this.broker.drain();

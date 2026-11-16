@@ -108,6 +108,9 @@ export interface Grant {
 export interface ApprovalPolicy {
   id: string; sessionId: string; approveAll: boolean;
 }
+export interface ConversationBoundary {
+  id: string; sessionId: string; afterObjectiveId: string | null;
+}
 export interface ExecutionRecord {
   id: string; sessionId: string; objectiveId: string;
   directory: string; baseline: Record<string, string>;
@@ -118,6 +121,7 @@ export interface ExecutionRecord {
 export interface Entities {
   objective: Objective; action: Action; decision: Decision; result: Result;
   source: Source; claim: Claim; model: ModelRequest; grant: Grant; approvalPolicy: ApprovalPolicy; execution: ExecutionRecord;
+  conversation: ConversationBoundary;
 }
 export interface V2Event {
   sequence?: number; type: 'state' | 'text' | 'action' | 'request' | 'usage' | 'plan' | 'result' | 'error' | 'runtime' | 'context';

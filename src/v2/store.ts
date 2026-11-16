@@ -81,6 +81,26 @@ export class V2Store {
     return rows.map(row => JSON.parse(row.data) as Entities[K]);
   }
   latest(sessionId: string): Objective | undefined { return this.list('objective', sessionId).at(-1); }
+  conversationObjectives(sessionId: string): Objective[] {
+    const objectives = this.list('objective', sessionId);
+    const boundary = this.list('conversation', sessionId)[0];
+    if (!boundary?.afterObjectiveId) return objectives;
+    const index = objectives.findIndex(objective => objective.id === boundary.afterObjectiveId);
+    if (index < 0) throw new HarnessError('CONTEXT', 'Saved conversation boundary references a missing objective.');
+    return objectives.slice(index + 1);
+  }
+  clearContext(sessionId: string): { session: V2Session; event: V2Event } {
+    return this.db.transaction(() => {
+      const session = this.session(sessionId);
+      const previousRuntimeId = session.runtimeId;
+      session.runtimeId = randomUUID();
+      this.db.prepare('UPDATE sessions SET runtime_id=? WHERE id=?').run(session.runtimeId, sessionId);
+      this.put('conversation', { id: sessionId, sessionId, afterObjectiveId: this.latest(sessionId)?.id ?? null });
+      const event = this.event({ type: 'runtime', sessionId, objectiveId: null,
+        data: { state: 'context_cleared', previousRuntimeId, runtimeId: session.runtimeId } });
+      return { session, event };
+    }).immediate();
+  }
   reportedModelAnchor(sessionId: string, frameHash: string) {
     const row = this.db.prepare<[string, string], DataRow>(`SELECT data FROM records
       WHERE kind='model' AND session_id=? AND status='completed'

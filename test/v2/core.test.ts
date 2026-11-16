@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, linkSync } from 'node:fs';
 import path from 'node:path';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
 import { V2Controller } from '../../src/v2/controller.js';
 import { Workspace } from '../../src/v2/workspace.js';
@@ -8,6 +8,133 @@ import { Semaphore } from '../../src/v2/resources.js';
 import { fixture, ScriptRuntime, approve } from './helpers.js';
 
 describe('V2 A02/A05/A06 product policy and coding primitives', () => {
+  it('clears only the current conversation and preserves settings, files and evidence across cold resume', async () => {
+    const f = fixture();
+    const runtime = new ScriptRuntime(async runtime => {
+      await runtime.call('workspace_patch', { path: 'created.ts', expectedHash: 'new', content: 'export const value = 2;\n' });
+      runtime.message('Historical assistant answer.');
+    });
+    let app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime });
+    const id = app.id;
+    try {
+      await app.clearContext(); await app.clearContext();
+      expect(runtime.opens).toBe(0);
+      app.setApproveAll(true);
+      const grant = app.broker.grant([path.join(f.workspace, 'notes.txt')], [], Date.now() + 60000);
+      const skills = app.listSkills();
+      const original = await app.submit('Create the synthetic source file.');
+      expect(original.status).toBe('partial');
+      const results = app.inspect().results;
+      const runtimeId = app.runtimeId;
+      await app.clearContext();
+      const freshId = app.runtimeId;
+      expect(freshId).not.toBe(runtimeId);
+      expect(app.id).toBe(id);
+      expect(app.inspect()).toMatchObject({ approveAll: true, objective: undefined, pending: [], results: [],
+        modelLimits: { prompt: { used: null } } });
+      expect(app.inspect().grants.map(item => item.id)).toContain(grant);
+      expect(app.listSkills()).toEqual(skills);
+      expect(app.config).toEqual(f.config);
+      expect(app.store.conversationObjectives(id)).toEqual([]);
+      expect(app.store.get('objective', original.id, id)).toEqual(original);
+      expect(app.store.list('result', id, original.id)).toEqual(results);
+      expect(app.store.readResult(id, results[0]!.id).text).toBeTruthy();
+      expect(readFileSync(path.join(f.workspace, 'created.ts'), 'utf8')).toContain('export const value = 2;');
+      await expect(app.continueObjective()).rejects.toThrow();
+      await app.close();
+      const next = new ScriptRuntime(async runtime => runtime.message('Fresh conversation answer.'));
+      app = await V2Controller.open({ config: f.config, sessionId: id, runtimeFactory: () => next });
+      expect(app.runtimeId).toBe(freshId);
+      expect(app.inspect().objective).toBeUndefined();
+      expect(app.inspect().approveAll).toBe(true);
+      expect(app.inspect().grants.map(item => item.id)).toContain(grant);
+      await app.submit('Fresh conversation prompt.');
+      expect(next.options).toMatchObject({ sessionId: freshId, resume: false });
+      expect(next.options!.directory).toBe(path.join(f.dataDir, 'runtime', id, freshId));
+      expect(app.store.conversationObjectives(id).map(objective => objective.original)).toEqual(['Fresh conversation prompt.']);
+      await app.close();
+      const resumed = new ScriptRuntime(async runtime => runtime.message('Resumed fresh conversation.'));
+      app = await V2Controller.open({ config: f.config, sessionId: id, runtimeFactory: () => resumed });
+      await app.submit('Continue the new conversation.');
+      expect(resumed.options).toMatchObject({ sessionId: freshId, resume: true });
+    } finally { await app.close(); f.cleanup(); }
+  });
+
+  it.each(['approval', 'question'])('rejects clear during preparation, pending %s and recovery without changing context', async kind => {
+    const f = fixture();
+    let ready!: () => void;
+    const pending = new Promise<void>(resolve => { ready = resolve; });
+    const runtime = new ScriptRuntime(async runtime => {
+      if (kind === 'approval') await runtime.call('workspace_read', { path: 'notes.txt' });
+      else await runtime.options!.question('A pending question?', ['Yes'], false);
+    });
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime });
+    app.subscribe(event => { if (event.type === 'request') ready(); });
+    const runtimeId = app.runtimeId;
+    try {
+      const work = app.submit('Wait for a live decision.');
+      await expect(app.clearContext()).rejects.toThrow('idle');
+      await pending;
+      await expect(app.clearContext()).rejects.toThrow('idle');
+      expect(app.inspect().pending).toHaveLength(1);
+      expect(app.runtimeId).toBe(runtimeId);
+      await app.cancel(); await work;
+      const objective = app.inspect().objective!;
+      objective.status = 'recovery_required'; app.store.put('objective', objective);
+      await expect(app.clearContext()).rejects.toThrow('reconcile');
+      await app.reconcile({ note: 'Checked the cancelled fixture.' });
+      await app.clearContext();
+      expect(app.inspect().objective).toBeUndefined();
+    } finally { await app.close(); f.cleanup(); }
+  });
+
+  it('admits reset before awaiting shutdown and rejects overlapping work', async () => {
+    const f = fixture();
+    const runtime = new ScriptRuntime(async runtime => runtime.message('Historical answer.'));
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime });
+    let release!: () => void;
+    const stopped = new Promise<void>(resolve => { release = resolve; });
+    try {
+      await app.submit('Historical prompt.');
+      vi.spyOn(runtime, 'close').mockImplementationOnce(() => stopped);
+      const clear = app.clearContext();
+      expect(app.inspect().busy).toBe(true);
+      await expect(app.submit('Conflicting prompt.')).rejects.toThrow('already admitted');
+      await expect(app.clearContext()).rejects.toThrow('idle');
+      await expect(app.continueObjective()).rejects.toThrow('active');
+      expect(() => app.reloadSkills()).toThrow('idle');
+      release(); await clear;
+      expect(app.inspect().busy).toBe(false);
+      expect(app.inspect().objective).toBeUndefined();
+    } finally { release(); await app.close(); f.cleanup(); }
+  });
+
+  it.each(['runtime', 'storage'])('reports %s reset failures without committing a partial boundary or reusing the failed runtime', async phase => {
+    const f = fixture();
+    const runtime = new ScriptRuntime(async runtime => runtime.message('Preserved historical answer.'));
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime });
+    try {
+      const objective = await app.submit('Preserved historical prompt.');
+      const runtimeId = app.runtimeId;
+      if (phase === 'runtime') vi.spyOn(runtime, 'close').mockRejectedValueOnce(new Error('Injected reset failure.'));
+      else app.store.db.exec(`CREATE TEMP TRIGGER fail_context_reset BEFORE INSERT ON events
+        WHEN NEW.type='runtime' AND json_extract(NEW.data,'$.state')='context_cleared'
+        BEGIN SELECT RAISE(ABORT,'Injected reset failure.'); END;`);
+      await expect(app.clearContext()).rejects.toThrow('Injected reset failure');
+      expect(app.runtimeId).toBe(runtimeId);
+      expect(app.store.session(app.id).runtimeId).toBe(runtimeId);
+      expect(app.store.list('conversation', app.id)).toHaveLength(0);
+      expect(app.inspect().objective).toEqual(objective);
+      expect(app.store.conversationObjectives(app.id)).toEqual([objective]);
+      await expect(app.submit('Do not silently reuse the failed runtime.')).rejects.toThrow('Retry /clear');
+      if (phase === 'storage') app.store.db.exec('DROP TRIGGER fail_context_reset');
+      await app.clearContext();
+      expect(app.runtimeId).not.toBe(runtimeId);
+      await app.submit('Fresh prompt after retry.');
+      expect(runtime.options?.resume).toBe(false);
+    } finally { await app.close(); f.cleanup(); }
+  });
+
   it('approves concurrent pending and future calls without answering questions, and restores per-call approval when disabled', async () => {
     const f = fixture();
     let pendingReady!: () => void, questionReady!: () => void, restoredReady!: () => void;

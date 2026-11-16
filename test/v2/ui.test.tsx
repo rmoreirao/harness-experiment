@@ -9,6 +9,68 @@ import { fixture, skillFile, ScriptRuntime } from './helpers.js';
 
 async function settle() { await new Promise(resolve => setTimeout(resolve, 70)); }
 describe('V2 A08 terminal continuity', () => {
+  it('clears the conversation, inspector and input recall, including after remount, without deleting evidence', async () => {
+    const f = fixture();
+    const runtime = new ScriptRuntime(async runtime => runtime.message('OLD_ASSISTANT_CONTEXT'));
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => runtime });
+    let screen = render(<V2TerminalApp controller={app} />);
+    const send = async (text: string) => { screen.stdin.write(text); await settle(); screen.stdin.write('\r'); await settle(); };
+    try {
+      await settle();
+      await send('OLD_USER_CONTEXT');
+      expect(screen.lastFrame()).toContain('OLD_ASSISTANT_CONTEXT');
+      const old = app.inspect().objective!;
+      const error = app.store.event({ type: 'error', sessionId: app.id, objectiveId: old.id,
+        data: { message: 'HISTORICAL_ERROR', code: 'FIXTURE' } });
+      app.setApproveAll(true);
+      await send('/status');
+      await send('/clear');
+      expect(screen.lastFrame()).toContain('Context cleared.');
+      expect(screen.lastFrame()).toContain('idle');
+      expect(screen.lastFrame()).toContain('APPROVE ALL: ENABLED');
+      expect(screen.lastFrame()).not.toContain('OLD_USER_CONTEXT');
+      expect(screen.lastFrame()).not.toContain('OLD_ASSISTANT_CONTEXT');
+      screen.stdin.write('\x1b[A'); await settle();
+      expect(screen.lastFrame()).not.toContain('/clear');
+      expect(screen.lastFrame()).not.toContain('> /status');
+      expect(app.store.get('objective', old.id, app.id)).toEqual(old);
+      await send(`/error ${error.data.errorId}`);
+      expect(screen.lastFrame()).toContain('HISTORICAL_ERROR');
+      await send('/back');
+      screen.unmount();
+      screen = render(<V2TerminalApp controller={app} />);
+      await settle();
+      screen.stdin.write('\x1b[A'); await settle();
+      expect(screen.lastFrame()).not.toContain('OLD_USER_CONTEXT');
+      expect(screen.lastFrame()).not.toContain('OLD_ASSISTANT_CONTEXT');
+    } finally { screen.unmount(); await app.close(); f.cleanup(); }
+  });
+
+  it('rejects clear during a live approval without losing the conversation or approving the call', async () => {
+    const f = fixture();
+    const app = await V2Controller.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => {
+      await runtime.call('workspace_read', { path: 'notes.txt' });
+      runtime.message('Preserved conversation.');
+    }) });
+    const screen = render(<V2TerminalApp controller={app} />);
+    const send = async (text: string) => { screen.stdin.write(text); await settle(); screen.stdin.write('\r'); await settle(); };
+    try {
+      await settle();
+      await send('WAITING_USER_CONTEXT');
+      const runtimeId = app.runtimeId;
+      await send('/clear');
+      expect(screen.lastFrame()).toContain('Context can only be cleared while idle');
+      expect(screen.lastFrame()).toContain('WAITING_USER_CONTEXT');
+      expect(screen.lastFrame()).toContain('APPROVAL REQUIRED');
+      expect(app.inspect().pending).toHaveLength(1);
+      expect(app.runtimeId).toBe(runtimeId);
+      await send('/approve');
+      expect(app.inspect().objective?.status).toBe('completed');
+      await send('/clear unexpected');
+      expect(app.inspect().objective?.original).toBe('WAITING_USER_CONTEXT');
+    } finally { screen.unmount(); await app.close(); f.cleanup(); }
+  });
+
   it('distinguishes uncapped usage, unknown billing and current context/output provenance', async () => {
     const f = fixture({ version: 3 });
     const app = await V2Controller.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => {
