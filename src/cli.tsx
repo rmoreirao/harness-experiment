@@ -5,8 +5,8 @@ import { createInterface } from 'node:readline';
 import { render } from 'ink';
 import { z } from 'zod';
 import { defaultDataDir, loadEnvironment } from './config.js';
-import { errorText } from './contracts.js';
-import { Redactor } from './privacy.js';
+import { errorText, record } from './contracts.js';
+import { Redactor, serializeHostMessage } from './privacy.js';
 import { Ownership } from './ownership.js';
 import { loadConfig, SDK_VERSION, RUNTIME_VERSION } from './config.js';
 import { Store } from './store.js';
@@ -14,7 +14,7 @@ import { SessionController } from './controller.js';
 import { HELP, TerminalApp } from './ui.js';
 
 async function headless(app: SessionController): Promise<void> {
-  const write = (value: unknown) => process.stdout.write(JSON.stringify(app.store.redactor.value(value)) + '\n');
+  const write = (value: unknown, authorizationUrl?: string) => process.stdout.write(serializeHostMessage(app.store.redactor, value, authorizationUrl) + '\n');
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   const unsubscribe = app.subscribe(event => write({ type: 'event', event }));
   const handle = async (line: string) => {
@@ -22,16 +22,39 @@ async function headless(app: SessionController): Promise<void> {
     try {
       if (Buffer.byteLength(line) > 131072) throw new Error('Headless command exceeds its byte limit.');
       const command = z.object({ id: z.string().max(100), operation: z.string(), args: z.record(z.string(), z.unknown()).default({}) }).strict().parse(JSON.parse(line));
-      id = command.id; let result: unknown;
+      id = command.id; let result: unknown; let authorizationUrl: string | undefined;
       switch (command.operation) {
         case 'inspect': result = app.inspect(); break;
         case 'skills': {
           const args = z.object({ action: z.enum(['list', 'reload']).default('list') }).strict().parse(command.args);
-          result = args.action === 'reload' ? app.reloadSkills() : app.listSkills(); break;
+          result = args.action === 'reload' ? await app.reloadSkills() : await app.listSkills(); break;
+        }
+        case 'trust': {
+          const args = z.object({ trusted: z.boolean() }).strict().parse(command.args);
+          app.trust(args.trusted); result = { trusted: app.trusted, unsandboxed: true }; break;
+        }
+        case 'permissions': {
+          const args = z.object({ mode: z.enum(['manual', 'assisted', 'allow-all']) }).strict().parse(command.args);
+          await app.setPermissionMode(args.mode); result = { mode: app.inspect().permissionMode }; break;
+        }
+        case 'mode': {
+          const args = z.object({ mode: z.enum(['interactive', 'plan', 'autopilot']) }).strict().parse(command.args);
+          await app.setTaskMode(args.mode); result = { mode: app.taskMode }; break;
+        }
+        case 'auth': {
+          const args = z.object({ action: z.enum(['status', 'login', 'advance', 'cancel']).default('status'), input: z.string().max(4000).optional() }).strict().parse(command.args);
+          result = await app.auth(args.action, args.input); break;
+        }
+        case 'mcp': {
+          const args = z.object({ action: z.enum(['list', 'status', 'login']).default('list'), serverName: z.string().min(1).max(200).optional() }).strict().parse(command.args);
+          result = await app.mcp(args.action, args.serverName);
+          if (args.action === 'login' && record(result) && typeof result.authorizationUrl === 'string') authorizationUrl = result.authorizationUrl;
+          break;
         }
         case 'submit': {
           const args = z.object({ objective: z.string().trim().min(1).max(100000), domain: z.enum(['general', 'coding', 'research', 'browser']).optional(), criteria: z.array(z.string().min(1).max(2000)).max(30).optional() }).strict().parse(command.args);
           const state = app.inspect();
+          if (!state.trusted) throw new Error('Explicit session trust is required before submitting native work.');
           if (state.busy || state.objective && ['preparing', 'running', 'awaiting_approval', 'awaiting_input', 'recovery_required'].includes(state.objective.status)) {
             throw new Error('One objective is already admitted; no second objective was accepted.');
           }
@@ -42,8 +65,9 @@ async function headless(app: SessionController): Promise<void> {
             error => write({ type: 'error', id, message: errorText(error) })); break;
         }
         case 'decide': {
-          const args = z.object({ id: z.string(), revision: z.number().int(), binding: z.string(), answer: z.string() }).strict().parse(command.args);
-          app.decide(args.id, args.revision, args.binding, args.answer); result = { decided: true }; break;
+          const args = z.object({ id: z.string(), revision: z.number().int(), binding: z.string(), answer: z.string(),
+            source: z.enum(['human_response', 'external']).default('external') }).strict().parse(command.args);
+          app.decide(args.id, args.revision, args.binding, args.answer, args.source); result = { decided: true }; break;
         }
         case 'cancel': await app.cancel(); result = app.inspect(); break;
         case 'continue': {
@@ -56,6 +80,7 @@ async function headless(app: SessionController): Promise<void> {
         case 'reconcile': {
           const args = z.object({
             note: z.string().min(1), actions: z.array(z.object({ id: z.string(), note: z.string() })).optional(),
+            workers: z.array(z.object({ id: z.string(), note: z.string() })).optional(),
             usage: z.array(z.object({ id: z.string(), input: z.number().int().nonnegative(), output: z.number().int().nonnegative() })).optional(),
           }).strict().parse(command.args);
           await app.reconcile(args); result = app.inspect(); break;
@@ -68,15 +93,10 @@ async function headless(app: SessionController): Promise<void> {
           const args = z.object({ after: z.number().int().optional(), limit: z.number().int().optional() }).strict().parse(command.args);
           result = app.store.events(app.id, args.after, args.limit); break;
         }
-        case 'grant': {
-          const args = z.object({ paths: z.array(z.string()), origins: z.array(z.string()), expires: z.number() }).strict().parse(command.args);
-          result = { id: app.broker.grant(args.paths, args.origins, args.expires) }; break;
-        }
-        case 'revoke': app.broker.revoke(z.string().parse(command.args.id)); result = { revoked: true }; break;
         case 'close': input.close(); result = { closing: true }; break;
         default: throw new Error('Unsupported headless operation.');
       }
-      write({ type: 'response', id, result });
+      write({ type: 'response', id, result }, authorizationUrl);
     } catch (error) { write({ type: 'error', id, message: errorText(error) }); }
   };
   try {
@@ -93,16 +113,17 @@ async function main(): Promise<void> {
     help: { type: 'boolean' }, version: { type: 'boolean' }, config: { type: 'string' },
     workspace: { type: 'string' }, 'data-dir': { type: 'string' }, headless: { type: 'boolean' },
     domain: { type: 'string' }, criterion: { type: 'string', multiple: true },
+    'trust-workspace': { type: 'boolean', default: false },
   } });
-  if (values.version) { console.log(`harness-experiment 0.1.0 | SDK ${SDK_VERSION} | runtime ${RUNTIME_VERSION}`); return; }
+  if (values.version) { console.log(`harness-experiment 0.2.0 | SDK ${SDK_VERSION} | runtime ${RUNTIME_VERSION}`); return; }
   if (values.help) {
-    console.log('harness [--config FILE] [--workspace FOLDER] [--data-dir FOLDER] [--domain general|coding|research|browser] [--criterion TEXT]\nharness sessions | resume SESSION_ID\n--headless: bounded JSON-lines API.\n\n' + HELP); return;
+    console.log('harness [--config FILE] [--workspace FOLDER] [--data-dir FOLDER] [--trust-workspace] [--domain general|coding|research|browser] [--criterion TEXT]\nharness sessions | resume SESSION_ID\n--headless: bounded JSON-lines API; trust must be explicit.\n--trust-workspace: explicitly trust this unsandboxed native session before workspace code loads.\n\n' + HELP); return;
   }
   loadEnvironment();
   const dataDir = path.resolve(values['data-dir'] ?? defaultDataDir());
   if (positionals[0] === 'sessions') {
     const store = new Store(dataDir);
-    try { for (const session of store.sessions()) console.log(`${session.id}  ${Ownership.held(dataDir, `v2-session:${session.id}`) ? 'active' : 'saved'}  ${session.config.workspace}`); }
+    try { for (const session of store.sessions()) console.log(`${session.id}  ${Ownership.held(dataDir, `native-session:${session.id}`) ? 'active' : 'saved'}  ${session.config.workspace}`); }
     finally { store.close(); }
     return;
   }
@@ -119,7 +140,7 @@ async function main(): Promise<void> {
   if (!values.headless && (process.platform !== 'win32' || !process.stdin.isTTY || !process.stdout.isTTY)) {
     throw new Error('Interactive mode requires Windows Terminal/PowerShell with a TTY. Use --headless or the exported API.');
   }
-  const app = await SessionController.open({ config, sessionId: resumeId });
+  const app = await SessionController.open({ config, sessionId: resumeId, trusted: values['trust-workspace'] });
   if (values.headless) {
     await headless(app);
     return;

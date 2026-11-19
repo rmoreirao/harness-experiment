@@ -1,91 +1,80 @@
-# Implementation and acceptance record
+# Native implementation evidence
 
-The Copilot SDK implementation is the repository's **only implementation**.
-The source and test trees, `harness` command and root package API are unversioned.
-Full production release acceptance remains incomplete.
+The current implementation follows
+[NATIVE_SDK_MIGRATION_PLAN.md](NATIVE_SDK_MIGRATION_PLAN.md).
+The historical custom-only acceptance map is superseded, not a supported mode.
 
-## Implemented product
+## Architecture
 
-| Area | Implementation and evidence |
+- One SDK-native runtime and SDK-managed parent/worker hierarchy.
+- Explicit session trust before executable workspace configuration is activated.
+- SDK permissions, separate interactive/plan/autopilot progression and real
+  developer workspace/environment.
+- Copilot or BYOK per session, configured per-agent models and provider-aware
+  usage records.
+- Workspace-only instruction/skill/agent/hook/MCP discovery.
+- Durable native/custom activity, worker identity, evidence and recovery.
+- Optional Docker mirrors/publication, retained research citation and controlled
+  browser functionality.
+- Fresh configuration/storage, without historical compatibility or fallback.
+
+## Acceptance evidence
+
+Validation on 2026-11-19:
+
+| Check | Result |
 |---|---|
-| Runtime/BYOK | Pinned SDK 1.0.34 and runtime 1.0.112; controlled Responses transport, exact model identity, streaming, custom tools, telemetry checks and no provider fallback. `test\runtime.test.ts`, `test\integrations.test.ts`. |
-| Objectives and planning | One admitted objective, persistent steps/evidence, domain completion checks, bounded replanning and stop-hook validation. `test\core.test.ts`. |
-| Source and execution | Filtered source tools, precise hash-bound edits, read-only Git, Docker mirrors and separately approved publication. `test\core.test.ts`, optional `test\providers.test.ts`. |
-| Research | Protected retrieval, decoded readable sources, exact evidence, claims, citation-checked reports and explicit uncertainty. `test\research.test.ts`, `test\network.test.ts`. |
-| Browser | Reviewed installed Chromium, isolated state, observation-bound actions and artifact provenance. Optional `test\providers.test.ts`. |
-| Policy and integrations | Exact approvals, read grants, read-only restriction, explicit approve-all mode, no-auth HTTP MCP and workspace skill snapshots. `test\core.test.ts`, `test\integrations.test.ts`, `test\skills.test.ts`. |
-| Continuity and recovery | Independent terminals, exclusive ownership, cold callbacks, reconciliation of unknown effects and no blind replay. `test\continuity.test.ts`, `test\storage.test.ts`. |
-| Resources/context | Version-3 uncapped defaults, explicit optional budgets, reported usage, auxiliary accounting and SDK-owned compaction settlement/application. `test\resources.test.ts`, `test\runtime.test.ts`. |
-| UI/distribution | Shared input editor, inspection and redacted errors, CLI/headless API, Windows ConPTY and installed-package acceptance. `test\editor.test.ts`, `test\environment.test.ts`, `test\ui.test.tsx`, `test\terminal-check.ts`, `test\package-check.ts`. |
+| `npm run typecheck` | Passed |
+| `npm run lint` | Passed |
+| `npm run build` | Passed |
+| Full Vitest suite with JUnit export | 265 passed, 3 explicit opt-in skips; report parsed and all 268 cases accounted for |
+| `npm run verify:terminal` | Passed actual Windows PowerShell/ConPTY, native SDK commands, permissions, cold recovery, trace/input/resize and shutdown |
+| `npm run verify:package -- <fresh native archive>` | Passed clean installation, bundled SDK, synthetic BYOK/usage, new-format cold resume and obsolete/private-file exclusion |
 
-## Consolidation contract
+The full suite includes actual SDK-native PowerShell execution and delegation
+to a custom worker using a distinct required model through a synthetic provider.
+It also denies a real SDK shell operation and asserts that its marker file was
+not written. Fixtures do not use paid model calls.
 
-The original OpenAI Agents SDK backend, fake-model mode, custom history
-compactor, standalone workflow engine and read-only legacy viewer are removed.
-Reusable input, diagnostics, redaction, path containment and native locking
-infrastructure remain part of the sole Copilot implementation.
+Integration fixes include parent/worker attribution, canonical SDK permission
+decisions, invocation replay prevention, compaction-summary settlement, explicit
+output-storage failures, host-only OAuth URL delivery, retryable failed shutdown,
+terminal exit rendering, and refusing to treat an unrelated successful command
+as recovery from a failed verification command.
 
-Only `harness` and the root `harness-experiment` API are exposed. The versioned
-command/subpath are removed, rather than maintained as alternate entry points.
-Builds replace their generated `dist` directory so older backend output cannot
-be repackaged accidentally.
+The SDK configuration, authentication and MCP contracts have deterministic
+coverage. Live Copilot sign-in, paid BYOK models and authenticated external MCP
+consent were not exercised. Two Docker acceptance cases and one installed-browser
+acceptance case were explicitly skipped because their opt-in prerequisites were
+not supplied. Physical clipboard/font behavior remains manual.
 
-Saved Copilot sessions keep configuration formats 2/3, exact defaults/digests,
-runtime mapping, usage, SQL schema and ownership identities. Existing `v2`
-storage names remain intentionally unchanged. No user database or private
-configuration is rewritten. Historical MVP checkpoints are not imported.
+Live provider/account model availability, paid requests, authenticated external
+MCP services and installed Docker images require explicit opt-in acceptance.
+An unavailable prerequisite is not a passed case, and synthetic responses are not
+proof that a live provider works.
 
-## Acceptance requirements
+The native migration plan contains the authoritative requirement matrix.
+Implementation completion must be reported with the actual commands/results and
+any remaining material limitations, not this document alone.
 
-| Scenario | Required evidence and current boundaries |
-|---|---|
-| A01 Runtime | Actual pinned SDK/native runtime with synthetic Responses, fixed identities, streaming, denial, usage and secret-free journals. Bounded live model evidence exists; it is not universal endpoint/capacity verification. |
-| A02 Coding | Failing disposable code check, focused fix, isolated successful check, conflict-aware publication and unrelated-edit preservation. Docker prerequisites must be explicitly installed/configured. |
-| A03 Research | Independent fixture sources and a contradiction, exact source support, cited report, honest failure/uncertainty. Fixture source counts are not universal requirements for every question. |
-| A04 Browser | Local-site observations/actions, denial without effect, fresh page state and isolated artifacts. JavaScript sites, personal authentication and uploads remain unsupported. |
-| A05 Recovery | Approval interruption, cold continuation, exact reconciliation, no duplicate objective/effect and preserved deadlines/evidence. Exhaustive native process-death injection is incomplete. |
-| A06 Policy/isolation | Protected path/network boundaries, stale decisions, disabled ambient tools/hooks, constrained containers and no host fallback. These controls are not a general OS sandbox against arbitrary external editors. |
-| A07 Resources | Explicit limits, concurrency, time/output bounds, auxiliary usage, unknown billing/effect distinctions and cancellation cleanup. Uncapped mode intentionally is not a spending ceiling. |
-| A08 Distribution | Independent processes, same-session exclusion, input/inspection, installed root API/CLI, old-session compatibility and exclusion of obsolete/private files. Physical clipboard/font observations remain manual. |
+## Outbound connectivity follow-up
 
-## Verification commands
+On 2026-11-19, changed the citation-retrieval default and example configuration
+from an empty origin list to `network.origins: ["*"]`. Public HTTPS sites no
+longer need individual origin entries. Explicit restricted lists and saved
+session policies remain intact; private/metadata and unsafe-URL protections are
+unchanged. Start a new session after rebuilding to use the new default.
 
-```powershell
-npm run typecheck
-npm run lint
-npm test
-npm run build
-npm run verify:terminal
-npm pack --pack-destination 'D:\harness-verification'
-npm run verify:package -- 'D:\harness-verification\harness-experiment-0.1.0.tgz'
-```
+The new regression `defaults citation retrieval to wildcard outbound access
+without a per-site allowlist` failed before the change and passed afterward.
+The targeted network/research/runtime suite passed all 59 tests; its JUnit report
+was parsed with zero failures. Typecheck, lint and build also passed.
 
-The archive destination must already exist. Pass the freshly generated archive
-explicitly rather than using an unrelated older package. The package check
-installs into a temporary directory, imports the installed root API and uses
-the bundled real runtime with synthetic loopback responses. It performs no
-registry publication or paid inference.
-
-`HARNESS_TEST_DOCKER_IMAGE`, `HARNESS_TEST_BROWSER` and
-`HARNESS_TEST_BROWSER_VERSION` enable reviewed installed local-provider fixtures.
-Without them those cases are explicitly skipped, not reported as passing.
-The separately guarded `verify:news` command is never part of routine CI.
-
-## Historical live evidence and remaining gates
-
-Before consolidation, the SDK-first implementation completed the exact Globo
-news request using `gpt-6-luna`: **42,730 reported tokens, eight requests, four
-supported headline records and one verified report**. Product budgets remained
-absent; the separately authorized verifier imposed a 100,000-token ceiling and
-2,048 output tokens per call. This is historical bounded live evidence, not a
-new paid run or unrestricted provider-output demonstration.
-
-The [SDK-first limits record](SDK_FIRST_LIMITS_PLAN.md) retains the detailed
-resource contract and historical validation. Synthetic runtime cases establish
-background compaction settlement, later summary application, cold resume and
-cancellation; production-context/provider compaction stress remains unverified.
-
-Live Brave search, exhaustive failure injection, native Windows execution/egress,
-browser SPAs/uploads/authentication and physical clipboard/font observations
-remain incomplete or deferred. Consolidation does not resolve these gates,
-broaden capability permissions or claim production release acceptance.
+Reran the exact user request, `what are the latest news on globo.com?`, through
+the actual harness using the configured live BYOK `gpt-6-luna` model and the
+production wildcard default, not a verifier-specific origin override. The request
+completed with one live Globo.com source, five source-backed headline references,
+one citation-verified report, no failed tool calls and no pending work.
+It used four model requests (62,630 input and 1,372 output tokens); cleanup
+completed. This establishes that live news rerun, not universal model accuracy or
+live Copilot/external MCP acceptance.

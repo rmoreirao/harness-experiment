@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { SessionController } from '../src/controller.js';
 import { loadConfig, parseConfig } from '../src/config.js';
 import { loadEnvironment } from '../src/config.js';
-import { errorText } from '../src/contracts.js';
+import { errorText, record } from '../src/contracts.js';
 import { Redactor } from '../src/privacy.js';
 import { CopilotRuntime } from '../src/runtime.js';
 
@@ -23,19 +23,20 @@ async function main(): Promise<void> {
     outputTokens: z.coerce.number().int().min(32).max(8192).parse(values['max-output-tokens'] ?? 2048) };
   loadEnvironment();
   const saved = loadConfig(values.config);
-  if (saved.version !== 3 || saved.limits.maxTokens !== undefined || saved.limits.maxCost !== undefined ||
+  if (saved.version !== 4 || saved.provider.kind !== 'byok' || saved.limits.maxTokens !== undefined || saved.limits.maxCost !== undefined ||
       saved.model.contextTokens !== undefined || saved.model.outputTokens !== undefined) {
-    throw new Error('Default-mode news verification requires a version-3 configuration without product token/currency budgets or prompt/output overrides. Existing explicit policies were not changed.');
+    throw new Error('Default-mode news verification requires a version-4 BYOK configuration without product token/currency budgets or prompt/output overrides. Existing explicit policies were not changed.');
   }
   const output = path.resolve(values['output-dir']); mkdirSync(output, { recursive: true });
   const directory = mkdtempSync(path.join(output, 'globo-live-'));
   const workspace = path.join(directory, 'workspace'); mkdirSync(workspace);
   const config = parseConfig({
-    ...saved, workspace, dataDir: path.join(directory, 'state'), skillsDirectory: undefined,
-    execution: undefined, browser: undefined, search: undefined, mcp: [],
+    ...saved, workspace, dataDir: path.join(directory, 'state'), permissionMode: 'manual',
+    skillDirectories: [], agentDirectories: [], hookDirectories: [], agents: [], mcpServers: {},
+    execution: undefined, browser: undefined, search: undefined,
   });
-  const app = await SessionController.open({ config, runtimeFactory: (resources, signal) =>
-    new CopilotRuntime(config, process.env.OPENAI_API_KEY ?? '', resources, signal, verificationBudget) });
+  const app = await SessionController.open({ config, trusted: true, runtimeFactory: (resources, signal) =>
+    new CopilotRuntime(config, config.provider.kind === 'byok' ? process.env[config.provider.apiKeyEnv] ?? '' : '', resources, signal, verificationBudget) });
   const unsubscribe = app.subscribe(event => {
     if (event.type === 'request') {
       const request = app.inspect().pending.at(-1)!;
@@ -44,9 +45,15 @@ async function main(): Promise<void> {
         if (request.allowFreeform || !request.choices?.length) app.decide(request.id, request.revision, request.binding, answer);
         else void app.cancel();
       } else {
-        const action = app.store.get('action', request.actionId, app.id);
-        const url = typeof action.args.url === 'string' && URL.canParse(action.args.url) ? new URL(action.args.url) : null;
-        const allowed = action.tool === 'web_fetch' && url?.protocol === 'https:' &&
+        let permission: unknown;
+        try { permission = JSON.parse(request.description.slice('SDK permission request:\n'.length)); }
+        catch { permission = null; }
+        const tool = record(permission) && permission.kind === 'custom-tool' && typeof permission.toolName === 'string'
+          ? permission.toolName : '';
+        const args = record(permission) && record(permission.args) ? permission.args : {};
+        const url = typeof args.url === 'string' && URL.canParse(args.url) ? new URL(args.url) : null;
+        const allowed = ['harness_research_claim', 'harness_research_report', 'harness_result_read', 'harness_work_inspect'].includes(tool) ||
+          tool === 'harness_web_fetch' && url?.protocol === 'https:' &&
           !url.username && !url.password && (url.hostname === 'globo.com' || url.hostname.endsWith('.globo.com'));
         app.decide(request.id, request.revision, request.binding, allowed ? 'approve' : 'deny');
       }

@@ -1,624 +1,221 @@
-# Harness guide
+# Native harness guide
 
-New sessions use **configuration version 3**: SDK-owned prompt/output defaults
-and **no cumulative task token budget**. Usage is still recorded, and optional
-budgets remain available. Existing version-2 sessions retain their saved limits.
-The design and validation record are in
-[`SDK_FIRST_LIMITS_PLAN.md`](../SDK_FIRST_LIMITS_PLAN.md).
+## Prerequisites and first launch
 
-The harness uses one Copilot runtime as its sole implementation, never an
-OpenAI/Copilot nested agent loop. Promotion to the default does not establish
-full release acceptance; known limitations remain documented below.
+Use Node.js 22.14.0 x64, Windows Terminal and PowerShell. Install dependencies with
+`npm ci`; native SQLite/file-locking modules may need Visual Studio C++ build tools.
+Build with `npm run build`.
 
-## Install and start
-
-Use Node.js **22.14.0 x64** on Windows Terminal/PowerShell (`.node-version`).
-`package-lock.json` pins `@github/copilot-sdk` **1.0.34**, its bundled platform
-runtime **1.0.112**, and `playwright-core` **1.65.0**. Runtime startup checks its
-actual version and telemetry policy. Native SQLite/locking dependencies may
-require Visual Studio C++ build tools if no compatible prebuilt binary exists.
+Copy `harness.example.json` to an ignored local configuration. Only native config
+version 4 is supported. Select an existing workspace and a fresh data directory
+outside it. Keep credentials in the environment or ignored `.env`, not in JSON.
 
 ```powershell
-npm ci
-npm run build
-Copy-Item .\harness.example.json .\harness.local.json
-# Edit the workspace, external data directory and model identities.
 node .\dist\cli.js --config .\harness.local.json
 ```
 
-In an installed package the command is `harness`.
-Do not use the example's `YOUR_USER` path unchanged. Application data must be outside the
-workspace. Configuration is strict and versioned; credential fields in JSON
-are rejected.
+Loading configuration does not trust the session. Read the native-execution
+warning and issue `/trust` before submitting work or loading SDK skills/auth.
+Workspace hooks and MCP processes must not start before trust.
 
-The existing ignored `.env` names remain:
+For unattended use, `--trust-workspace` is an explicit trust grant for that
+session. Do not add it to an unreviewed invocation merely to bypass a warning.
 
-```dotenv
-OPENAI_BASE_URL=https://your-endpoint.example/v1
-HARNESS_MODEL=your-canonical-model-identifier
-HARNESS_WIRE_MODEL=your-deployment-identifier
-OPENAI_API_KEY=your-key
+## Providers and model selection
+
+Choose one provider for a session:
+
+- Copilot: `{ "kind": "copilot" }`, using SDK-supported sign-in and model discovery.
+- BYOK: `{ "kind": "byok", "baseURL": "https://your-endpoint.example/v1",
+  "apiKeyEnv": "OPENAI_API_KEY" }`.
+
+`model.canonical` selects the parent model and `model.wire` identifies its BYOK
+deployment where different. Additional configured models allow worker overrides
+within the same provider. A required unavailable model is an error; providers are
+not mixed or silently substituted.
+
+```text
+/auth status
+/auth login
+/auth advance
+/auth cancel
 ```
 
-Environment values override JSON when nonempty. `HARNESS_WIRE_MODEL` is optional
-when canonical and deployment identities match. Responses HTTP/SSE is the only
-wire API; there is no account, endpoint, model, transport or provider fallback.
-Plain HTTP model endpoints are allowed only on loopback.
+Follow the returned SDK browser/device authorization instructions. Do not paste
+tokens, passwords or device codes into an ordinary model objective. Login output
+is a host interaction, not agent conversation evidence.
+Use `/auth login proxima` for the supported enterprise device flow. If the SDK
+requests account selection or plaintext-storage consent, supply the explicit
+choice with `/auth advance VALUE`; neither choice is made automatically. Headless
+`auth` accepts an optional `input` string for the same flow.
 
-### Model limits and optional spending policies
+The CLI loads `.env` from the launch directory; existing environment variables
+take precedence. Native commands use normal developer profiles, but known
+harness-owned provider/search keys are not automatically inherited. Commands can
+still read files your account can access.
 
-Omit `model.contextTokens` and `model.outputTokens` to use the SDK/provider
-defaults. The harness does not inject a 32,000-token prompt limit or rewrite
-normal requests to force a 2,048-token response limit. The SDK owns conversation
-history and compaction; there is no second harness compactor.
+## Permissions and task progression
 
-The terminal and headless `inspect` distinguish cumulative `objective.usage`,
-current `modelLimits.prompt`, response allowance `modelLimits.output` and
-`budget`. Cached context metadata is labeled `runtime reported`, `explicit
-override`, or `unavailable`; it is **not provider-verified model capacity**.
-The pinned runtime can report the same generic 128,000 allowance even for an
-unknown model. Use deliberate deployment overrides when that fallback does not
-match the selected endpoint. Unavailable metadata does not fail model work.
+After explicit trust, the default permission mode is `allow-all`. This permits
+native commands, edits and network access without ordinary per-action prompts
+where enforced policy allows. It grants no administrator privileges or sandbox.
 
-Without `limits.maxTokens` or `limits.maxCost`, cumulative usage can exceed
-100,000 and spending can be higher. Request/action limits and timeouts are not
-money caps. To deliberately enable a token admission policy, for example:
-
-```json
-{
-  "version": 3,
-  "model": { "outputTokens": 2048 },
-  "limits": { "maxTokens": 100000 }
-}
+```text
+/permissions manual
+/permissions assisted
+/permissions allow-all
+/approve_all
+/approve_all off
 ```
 
-Merge those fields into a complete configuration or an `.env`-configured launch.
-Currency policies also require `limits.maxCost`, `inputPerMillion` and
-`outputPerMillion`; separately charged search requires its configured price.
-An explicit budget needs a finite output bound in the actual SDK request. If
-none is available, admission fails before dispatch with instructions to set
-`model.outputTokens`; the harness does not invent a default to satisfy it.
-Zero, `null` and infinity are not unlimited-budget sentinels: omit the field.
+The final two commands select allow-all and manual respectively. Managed-policy
+requests may still require an explicit answer. `/approve` or `/reject` applies to
+the displayed live SDK request, not to an arbitrary future command.
 
-The example and configuration-free launches use version 3. Existing local files
-are not rewritten. Start a **new session** for these defaults. `resume SESSION_ID`
-restores the exact saved configuration, so historical
-version-2 policies (including materialized 100,000 / 32,000 / 2,048 defaults)
-are not silently removed, enlarged or migrated in the database.
+Task progression is separate:
 
-Provider/search keys stay in the application-owned HTTP adapters. The runtime
-gets a noncredential placeholder, a scrubbed environment, a private empty working
-directory, and a session-specific `runtime\SESSION_ID` configuration namespace.
-`mode: empty`, disabled discovery/instructions/plugins/native tools/subagents,
-`COPILOT_TELEMETRY_LEVEL=off`, and `enableSessionTelemetry=false` are explicit on
-every create/resume. Startup refuses a runtime reporting enabled error telemetry.
-Application diagnostics redact configured keys and sanitize terminal controls.
-This is not encryption or automatic detection of every sensitive document.
-
-## Capabilities and prerequisites
-
-**Source work:** filtered discovery/globs, paged UTF-8 reads, literal search,
-hash-bound precise edits and explicitly destructive deletion. Binary files,
-credential paths, generated trees, reserved Windows paths, links and hardlinks
-are excluded. Git status/diff/log use fixed arguments, disabled configuration
-helpers, and admitted source-text diff paths; no stash/reset/ref/commit/push
-operation exists. Linked `.git` worktrees and repositories with helper/include
-configuration are deliberately rejected rather than executing untrusted helpers.
-Edits coordinate application writers and recheck hashes, not an atomic transaction
-against arbitrary external editors. Multi-file publication preflights every
-baseline; an external race after preflight can still produce partial publication,
-which is recorded as unknown rather than successful.
-
-**Execution:** configure a preinstalled, reviewed Linux image by immutable ID:
-
-```json
-{ "execution": {
-  "provider": "docker",
-  "image": "sha256:REPLACE_WITH_64_HEX_DIGITS",
-  "memoryMb": 512,
-  "cpus": 1
-} }
+```text
+/mode interactive
+/mode plan
+/mode autopilot
 ```
 
-Docker Desktop must already be running. Use an image with your required
-executables/toolchain preinstalled. The application never pulls images, mounts
-the host home or engine socket, supplies provider keys, or falls back to a host
-shell. Its fixed local engine connection, inspected container configuration,
-nonroot UID, dropped capabilities, read-only root, no network, PID/memory/CPU
-limits and bounded attachment/output apply to each process. Only a filtered,
-session-owned workspace mirror is writable. Tool arguments cannot specify engine
-flags or mounts. Installation commands are arbitrary execution; network package
-installation is unavailable. Native Windows toolchains and controlled execution
-egress remain blocked pending a separately proved provider.
+Interactive is the default. Autopilot does not itself grant tool permissions.
 
-`execution_changes`, `execution_read` and `execution_publish` inspect stopped
-mirrors and publish selected exact hashes through host-baseline conflict checks.
-Full process output, exit code, image and execution identity remain inspectable.
-Cancellation/timeout removes the exact owned container before ownership release.
-Mirrors remain as local evidence; the product does not delete user checkout data.
+## Workspace configuration and workers
 
-**Research:** allow exact public HTTPS origins under `network.origins`, or
-explicitly opt into `["*"]` for all public HTTPS origins. Retrieval
-pins validated DNS addresses, rejects protected/mixed address sets, bounds bodies,
-time and redirects, and never forwards credentials across origins. Cross-origin
-redirect errors include the destination URL so the agent can request it through
-a separately approved retrieval. Explicit literal-loopback origins
-under `localFixtureOrigins` are for controlled local sites only.
-Raw response bodies default to a bounded **5 MiB** cap (configurable up to
-10 MiB). Only extracted readable content is stored as source text; a large HTML
-page does not mean its scripts/style payload is sent wholesale to the model.
+SDK instructions, skills, agents, hooks and MCP sources are limited to trusted
+workspace configuration. Personal Copilot instruction/agent/hook/MCP files are not
+discovered. Developer tools may still use ordinary Git/npm profiles and account
+credential stores.
 
-```json
-{
-  "version": 3,
-  "network": { "origins": ["*"], "maxBytes": 5242880 }
-}
+Workspace roots include `.github\skills`, `.github\agents` and `.github\hooks`
+unless explicitly configured otherwise within the workspace. Symlinked or
+out-of-workspace discovery roots are not a way to load personal configuration.
+Configured SDK MCP servers may be local stdio processes or remote integrations.
+Authentication and availability errors are explicit.
+
+```text
+/skills list
+/skills reload
+/mcp list
+/mcp status SERVER
+/mcp login SERVER
 ```
 
-The wildcard grants destination reachability, **not automatic tool approval**.
-HTTP, private/metadata addresses and private DNS remain blocked unless an exact
-literal-loopback fixture scope applies. Redirect, query/export, body/time limits,
-and browser submission controls are unchanged. Trusted-read grants must still
-name exact HTTPS origins; `*` is not a read grant. Configured search/MCP endpoints
-can use wildcard public reachability, but credentials, explicit server trust,
-tool allowlists and approvals are still required.
+Reload restarts SDK discovery while idle. It is not a separate harness snapshot
+catalog.
+MCP login returns the SDK's authorization URL; open it and complete consent, then
+inspect server status. The SDK owns the loopback callback and credential storage.
+Only explicitly configured workspace services are eligible. Authorization URLs
+are host responses, not model messages or journal evidence.
 
-Save this in `harness.local.json` and start a new session with `--config`.
-Defaults remain deny-by-default; old sessions retain their saved network policy.
+Built-in specialists and custom agents run under the parent objective. Parent and
+worker activity must remain distinguishable. Use non-overlapping file
+assignments for concurrent writers; the retained assignment tools detect
+conflicting reservations. This is coordination, not filesystem confinement.
 
-Optional search uses the **Brave Web Search v1** connector:
+## Activity and evidence
 
-```json
-{
-  "search": { "provider": "brave", "costPerRequest": 0.01 },
-  "network": { "origins": ["https://api.search.brave.com"] }
-}
+Citation retrieval (`harness_web_fetch`) defaults to `network.origins: ["*"]`.
+Any public HTTPS origin, including Globo.com and its subdomains, is admitted
+without listing individual sites. You can explicitly set `origins: []` or an
+exact-origin list to restrict retrieval. Private/metadata destinations and unsafe
+URLs remain blocked; this does not impose restrictions on native shell networking.
+
+Existing sessions retain their saved configuration. After rebuilding, start a
+new session without an old restrictive configuration, or set
+`"network": { "origins": ["*"] }` in your configuration before starting a new one.
+
+```text
+/status
+/plan
+/trace on
+/trace expand
+/trace older
+/trace latest
+/trace CALL_ID
+/inspect RESULT_ID
+/events
+/errors
 ```
 
-The price is an illustrative user-configured maximum in the same currency as
-model pricing, **not an assertion about Brave's actual price**. Supply the
-separate `BRAVE_SEARCH_API_KEY` securely. A currency cap requires that maximum;
-it is charged conservatively before dispatch, including failures. Missing keys
-or unknown priced-tool charges are explicit errors, never fabricated search
-results. Search snippets are not evidence.
+`/plan` reads the SDK plan. Trace output shows model/tool activity and workers;
+output inspection does not rerun effects. Arguments/results are bounded and
+redacted where known. Hidden reasoning and raw authentication secrets are not
+product evidence.
 
-Retrieved sources include final URL, retrieval time, content hash, extraction
-method and result ID. Publication dates remain unknown when not established.
-Claims require exact retrieved quotes, conflict references and uncertainty.
-Reports use `[source:SOURCE_ID]`; their citations and recorded claims are checked
-against stored content. Same-host pages are not independent confirmations.
-Structural/quote verification is not a universal factual-truth or editorial-
-independence guarantee.
+Token/monetary caps are optional and only accepted where enforceable. Parent and
+worker requests are aggregated without duplicate counting. Copilot consumption
+is not automatically equivalent to BYOK prices. Unknown usage/cost is labeled,
+not estimated as zero.
+These limits cover intercepted model requests and explicitly priced retained
+domain requests, not total account or machine spending. Arbitrary native commands
+and external MCP services can incur independent charges outside that accounting
+boundary. The displayed tracked cost is not a whole-system spending guarantee.
+Native defaults allow one hour per objective, five minutes per tool/model
+request, 1,000 model requests and 1,000 actions. These remain explicit configurable
+limits, not spending caps. Command/model/worker concurrency defaults to four;
+configured examples may choose a lower command limit. Increase deadlines for
+long builds or deliberately long-running commands as needed.
 
-HTML5 named/numeric entities are decoded before source storage. `web_fetch`
-returns a small set of `source.evidence` headline records with exact source
-spans and article links. Prefer `{ "sourceId": "...", "evidenceId": "..." }`
-when registering claims. Quote references remain supported: whitespace or
-escaped-line-break formatting can be normalized, but the stored quote is always
-the matching original source span. Different words, dates and numbers still
-fail; no fuzzy factual matching is used.
+Coding completion uses native command evidence instead of requiring Docker.
+Relevant checks and review of changed files remain part of the task. Native web
+retrieval alone does not establish a citation-verified research report; use the
+retained evidence/report tools for that contract.
 
-For a concise overview on a named site, one current homepage and one aggregate
-supported claim/report can suffice; the deterministic multi-origin fixture is
-not a minimum for every question. Avoid refetching whole pages to repair quotes.
-Reports attach canonical recorded claims/uncertainty when a draft omits their
-exact wording; the returned `canonicalEvidenceAppended` flag makes that explicit.
-Unsupported citations still fail. Use `research_report.planResultId` for plan
-evidence, not a claim ID or source ID.
+## Cancellation, recovery and sessions
 
-**Browser:** configure a reviewed, installed Chromium executable and exact version:
-
-```json
-{
-  "browser": {
-    "executablePath": "C:\\path\\to\\chrome.exe",
-    "version": "156.0.8078.4",
-    "javaScript": false
-  }
-}
+```text
+/cancel
+/reconcile {"note":"inspected effects","actions":[],"workers":[],"usage":[]}
+/continue
+/clear
+/exit
 ```
 
-The version above was exercised locally; inspect your binary's version instead
-of copying it blindly. There is no browser download or personal-profile reuse.
-Each session owns a clean browser/context. HTTP requests are fulfilled through the
-same protected, DNS-pinned adapter and must match the approved exact URL, method
-and body hash; new tabs, WebSockets, service workers, uploads, arbitrary scripts,
-JavaScript-enabled sites and personal authentication are disabled. Scripted/SPAs
-are consequently not supported yet.
+Cancellation stops owned work where supported; completed edits, network requests
+and other external effects are not undone. Uncertain actions/workers remain
+unresolved until explicitly inspected and reconciled. A restart does not replay
+expired approvals or blindly rerun commands.
 
-Actions require a fresh accessibility observation. Changed page state invalidates
-the action; approval of navigation is not approval of a form submission.
-Screenshots are immutable artifacts. Separate downloads are bounded quarantined
-artifacts with provenance, not executable inputs or automatically published
-workspace files. Use `result_read` to inspect them (binary pages are base64).
-For browser verification supply original expected page text with
-`--domain browser --criterion "Expected result"` or through the headless API.
-
-**Skills:** The harness automatically loads every `<skill-name>\SKILL.md` in the workspace's
-`.github\skills` directory when the app opens, including cold resume. The default
-uses the GitHub Copilot skill layout. To select another workspace-relative folder,
-set `"skillsDirectory": "local-skills"` in configuration. Absolute paths,
-workspace escapes, protected paths, symlinks/junctions and hardlinked files are
-rejected. A missing default folder means no custom skills; a missing configured
-nondefault folder is an error.
-
-For example, create `.github\skills\review-notes\SKILL.md`:
-
-```markdown
----
-name: review-notes
-description: Review project notes and summarize outstanding questions.
----
-Read the relevant notes, identify unresolved questions, and cite the source files.
-```
-
-Names must match their directory, use lowercase letters/digits with single
-hyphens, and be at most 64 characters. YAML frontmatter requires a nonempty
-description (up to 1024 characters) followed by nonempty Markdown instructions.
-Other metadata is accepted but does not enable hooks or tools. Only immediate
-child folders with a `SKILL.md` are loaded; supporting assets/scripts are not
-automatically read or executed. File, directory-entry and aggregate byte limits
-apply. Malformed skills fail startup explicitly rather than loading a partial set.
-The bundled `coding`, `research` and `browser` names remain reserved.
-
-`/skills list` (or `/skills`) shows names, descriptions and sources.
-`/skills reload` applies edits, additions and removals without restarting the app.
-Reload is allowed only while idle; a failed reload leaves the previous snapshot
-unchanged and displays the error. There is no file watcher. Each objective gets
-the current catalog; `workflow_skill` retrieves relevant instructions from the
-already-loaded snapshot on demand, so all skill bodies are not injected into
-every prompt. Content hashes and catalogs are recorded in the session audit.
-Earlier conversation entries may still contain older instructions after reload;
-the current catalog and newly retrieved content identify the active versions.
-
-Startup and explicit reload authorize reading only these skill documents without
-per-file prompts. Custom skill text remains untrusted guidance: it cannot grant
-permissions, broaden an objective, bypass action approvals, enable tools, or
-execute scripts/hooks. Supporting file reads still use the normal approved tools.
-Ambient SDK skills, marketplace install and plugin discovery remain disabled.
-
-**Integrations:** explicitly trusted no-auth HTTP MCP supports
-configured server/tool allowlists, local schema validation, protected transport
-and exact approvals. Stdio MCP and authenticated connectors are not enabled.
-Currency-capped MCP calls remain disabled because remote charges are unknown.
-
-## Decisions, limits, results and recovery
-
-Approval-first is the default. Read-only restriction is **not** a read grant.
-`/grant` creates a visible, revocable path/public-origin read grant with an
-explicit expiry of at most 24 hours. Writes, commands and submissions still ask.
-URL query strings never inherit a trusted-read grant: query/export arguments
-need exact approval. An origin grant is not permission to export workspace data.
-Decisions bind session/objective/action/arguments/request revision and
-preconditions. Changed or restored requests cannot reuse an old approval.
-
-`/approve_all` explicitly enables **session-wide tool approval** and approves all
-currently live pending tool calls at once. Future calls, including writes,
-execution and submissions, no longer prompt in this session. The setting is
-stored separately from configuration, survives resume, and never enables another
-session. A dedicated bold yellow `APPROVE ALL: ENABLED` line stays above the
-scrolling conversation/inspectors while enabled, including when idle after
-resume; `/status` also shows the mode. The line disappears when disabled.
-Policy changes and exact approved decisions remain recorded. Questions still require user answers.
-Read-only restrictions, disabled capabilities/providers, path/network rules,
-hash/observation preconditions, budgets and recovery requirements remain enforced.
-Expired/interrupted calls are not replayed or approved.
-
-Use `/approve_all off` to restore per-call approval for subsequent calls.
-It does not revoke calls already approved or remove existing trusted-read grants.
-
-`/status`, `/plan`, `/request`, `/inspect RESULT_ID [BYTE_OFFSET]`, `/events`,
-`/cancel`, `/continue`, `/clear`, `/reconcile`, `/back` and `/help` provide inspection and
-control. Multiline input, safe paste, history editing, scrolling and resizing use
-the shared input decoder. Clipboard/font behavior still needs physical terminal checks.
-
-Pending questions wrap in the **INPUT NEEDED** panel, including any supplied
-choices. The panel takes space from conversation/trace history before hiding
-question text; the answer field remains available. On short terminals, optional
-workspace/usage/context/trace footer lines yield space to the request.
-If the question or approval scope is too tall, `More: /request` explicitly
-indicates overflow. `/request` opens the complete readable request from its
-first line, not a JSON dump. PageDown/PageUp scroll forward/backward, with a line
-counter; `/back` returns to the conversation. These commands do not answer,
-approve, or replay anything. Type a listed choice exactly when freeform answers
-are disabled. Answering a question never approves a subsequent tool action.
-
-### Inline execution trace
-
-Tracing is **off on each launch**. `/trace on` adds the current objective's plan
-and chronological tool/model activity to the conversation. `/trace off` hides
-that display without stopping work, changing permissions, or deleting audit
-records. The ordinary approval prompts and error notices remain active either way.
-An active `work_question` awaiting an answer is labeled **waiting for input**,
-not running, and is never folded into successful activity.
-
-Trace activity is an accordion. A completed successful trace starts as
-`> Trace | ...`; click the header to expand it to `v Trace | ...`. Individual
-model/tool headers also expand in place to show their recorded, redacted
-metadata. Active traces and traces containing failed, denied, unknown or
-cancelled operations open by default. A manually collapsed header still shows
-issue counts. Questions and approvals stay outside the accordion.
-
-For keyboard navigation, **Ctrl+T** switches between the trace and composer.
-Up/Down selects a disclosure header; Space/Enter toggles it, Right opens it,
-and Left closes it. Ctrl+T returns to the composer; typing text also returns
-focus without losing the draft. Enter sends only when the composer is focused.
-Mouse clicks and keyboard expansion never replay a tool or invoke a model.
-
-Mouse reporting is enabled only with `/trace on` and restored by `/trace off`
-or exit. It can affect ordinary terminal text selection while enabled.
-Trace mode uses a dedicated terminal screen so click coordinates remain aligned
-after scrolling and resizing; `/trace off` or exit restores the normal screen.
-PageUp/PageDown inspect its recorded history.
-The Windows UI uses a single native console-input reader through the pinned
-`koffi` dependency because Node's default Windows TTY reader drops mouse events.
-It preserves keyboard/paste decoding, forwards resize events, and restores the
-original console mode on shutdown. Headless input is unchanged.
-
-When activity overflows the terminal viewport, older contiguous successful
-calls fold into count rows, such as `Earlier success: 2 model + 3 tool calls`.
-The newest success, running calls, approval waits, failures, denied actions and
-unknown outcomes remain separate. This is local display folding, **not an
-LLM-written summary**; it makes no additional model calls.
-
-Use `/trace expand` to unfold the current page and `/trace collapse` to restore
-compact history inside the trace group. Expansion stays open as new events arrive. History is bounded
-to 40 calls per page: `/trace older` loads the preceding page and `/trace latest`
-returns to live activity. PageUp/PageDown scroll the displayed content.
-Scrolling up pauses live additions so the inspected rows do not shift;
-scrolling back to the bottom, or `/trace latest`, resumes following.
-An active call remains visible in the trace status line even while inspecting
-an older history page.
-Opening an individual call during active work pauses live additions so its
-details stay stable; `/trace latest` resumes following. Operation status continues
-to update from recorded lifecycle data.
-
-`/trace CALL_ID` inspects an operation using its displayed `t-...` or `m-...` ID,
-or its full durable ID. Ambiguous prefixes require the full ID. Tool details show
-redacted arguments and a result ID for existing `/inspect` pagination, without
-replaying the tool or granting approval. Model details show the configured
-canonical/wire identity, runtime-supplied interaction type when available,
-duration through the end of the response stream, and reported input/output
-tokens. Cost is unknown without reported usage and configured pricing.
-`/back` returns from the inspector.
-
-The trace does not include raw prompts or hidden model reasoning. Older records
-without timing or task associations show unavailable values; missing accounting
-is not presented as zero or as a request that is still running. Resume reads
-stored records without replay. `/clear` removes the current conversation's trace
-from view, not its saved evidence.
-
-`/clear` starts a fresh SDK model conversation in the same harness session and
-clears the visible conversation, input recall history and open inspector.
-It requires idle work with no pending approval/question or unresolved recovery:
-finish or `/cancel` active work, and reconcile unknown effects first.
-The empty context survives resume, even if you exit before sending another prompt.
-Configuration, loaded skills, trusted-read grants, `/approve_all` settings and
-workspace files are unchanged. Historical objectives, usage, results, errors,
-audit events and runtime journals remain saved and inspectable; this is not
-secure deletion or a privacy boundary. Old evidence is not automatically replayed
-into the new conversation, but explicit inspection tools can still retrieve it.
-`/continue` cannot revive an objective from a cleared conversation.
-The CLI and headless operation set use the same controller.
-
-`/errors` lists the latest 20 recorded errors in this session, including earlier
-objectives and failed/denied/unknown tool actions. Errors display a stable ID such
-as `error-12`; `/error error-12` shows timestamp, objective/call identities and
-available diagnostic details. Use the displayed `/errors BEFORE_ID` command to
-page through older entries. Errors remain inspectable after resume and inspection
-never replays a failed action. New diagnostics preserve bounded, redacted stacks,
-causes, codes and available model HTTP status/provider request IDs; historical
-entries retain only their originally recorded details. No request/response bodies,
-prompts or tool arguments are added to these diagnostics. Error messages can
-still contain sensitive document data, so review them before sharing. An error
-history write failure is reported explicitly. Failures before a session opens
-are outside this inspector.
-
-### Troubleshooting web-fetch failures
-
-`DESTINATION: Destination origin ... is not configured` is a policy denial,
-not an HTTP/DNS outage. The default network allowlist is empty. Approving a
-tool request does not add domains to it.
-
-For an `.env`-configured launch, a minimal `harness.local.json` for Globo/G1
-is below. If you already have a configuration file, merge these origins into it
-instead of replacing its other settings:
-
-```json
-{
-  "version": 3,
-  "network": {
-    "origins": ["https://www.globo.com", "https://g1.globo.com"],
-    "maxBytes": 5242880
-  }
-}
-```
-
-After reviewing the permitted origins, use `/exit`, rebuild, and start a **new**
-session with `node .\dist\cli.js --config .\harness.local.json`.
-Resuming an older session deliberately restores its saved allowlist.
-This permits requesting those origins; later HTTP, body-size, redirect or
-extraction failures are still reported explicitly and do not guarantee headlines.
-
-`BODY_LIMIT` includes the observed/declared byte count and `network.maxBytes`.
-Modern news portals can contain several megabytes of HTML even when their
-readable text is small. A configured 1 MiB limit remains valid but may reject
-such pages; raise it deliberately and start a new session rather than disabling
-body limits. Globo was observed returning roughly 2.65 MB of HTML and 29 KB of
-readable text, which fits the 5 MiB default. A redirect from `globo.com` to
-`www.globo.com` still requires a separate approved fetch of the reported URL.
-
-Tool failures are returned as bounded, redacted SDK failure results, not thrown
-into the SDK's generic exception formatter. `/status` and model `work_inspect`
-also expose ten recent failed actions from this session, including earlier
-objectives, without re-running the failed actions or rewriting runtime history.
-
-Product state lives in separate `product-v2.db`, result files, locks, mirrors and
-runtime directories under the application data root. SQLite never rewrites Copilot
-conversation items or compaction. The original objective, steps, dependencies,
-verification references and budgets are independent of runtime conversation
-summaries. Plan updates use the SDK plan RPC and are checked against the product
-projection before continuation.
-
-One objective is admitted before asynchronous SDK preparation starts. Ownership
-is OS-backed and held through owned-work cleanup. On interrupted approval or
-unknown effects, inspect the ledger and use an explicit reconciliation note and
-exact action/request IDs. Reconnection is never approval or automatic replay.
-A divergent runtime plan is not silently repaired by editing its journal.
-Reconciled continuation keeps the original objective, counters and deadline.
-
-Explicit token/currency limits enforce **request admission**, not a guarantee
-about an arbitrary provider's billing behavior. Without either policy, model
-and auxiliary requests record start/outcome and actual usage without byte-token
-reservations or prefix lookups. Pending requests still prevent false completion.
-
-With an explicit budget, admission starts with a conservative UTF-8 byte bound.
-After confirmed provider usage, an **exact unchanged input
-prefix** and identical model/tool/request settings can reuse the measured prefix
-count and reserve bytes only for newly appended input. The bound includes the
-previous output, the actual request's finite output bound and 4096 framing overhead.
-Changed/compacted input, changed settings, another interaction type, unconfirmed
-usage or missing historical fingerprints fall back to the full byte bound.
-Only hashes and an input-item count are persisted for this check, never another
-copy or rewrite of runtime conversation history.
-
-Reported input/output tokens are still counted in full on every request,
-including cached prefixes; this is not a discount or an increased spending cap.
-Model concurrency is actually one;
-tool concurrency uses an application semaphore. With a configured budget,
-unknown/missing usage or usage exceeding reservation stops work for
-reconciliation. Without a budget, unknown billing remains visible but does not
-alone fail a verified answer; actual model failures, pending requests and unknown
-external effects remain blocking. Reported token totals and configured prices
-are persisted; unknown cost is `null`, never zero. Known search charges survive
-model-usage reconciliation, and unpriced charges remain unknown.
-Local admission errors are returned to the SDK as terminal, non-retryable errors
-and the application preserves the specific reason instead of hiding it behind
-five generic model retries. The error states used, required and remaining tokens;
-use `/errors` / `/error` for recorded diagnostic details.
-
-Request/action/replan counts, file/workspace/result/output sizes, network and tool
-deadlines are independent bounds. The objective deadline is a conservative wall
-deadline: approval waits, downtime and continuation do not reset it. Upstream
-violations, unreported service charges or already billed in-flight work cannot be
-undone; such observations are not called hard billing enforcement.
-
-`maxWorkspaceBytes` bounds the initial filtered mirror and discovery/search work,
-not a hard OS disk quota on a running container's writable bind mount. A command
-can temporarily exceed that size before its timeout; hard sandbox disk quotas
-remain a release gap, not an enforced guarantee. Do not approve disk-intensive
-or untrusted workloads expecting a host-disk quota.
-
-Idle alone is not completion. Coding requires an actual successful isolated
-check and inspected diff; research requires a quote/citation-validated report;
-browser work requires observed user acceptance text. Plans cannot mark steps
-done without result references or completed prerequisites. These structural
-checks do not prove that an arbitrary command or model assertion satisfies all
-possible user requirements.
-These checks are also inferred from the capabilities used, including mixed
-workflows; selecting the default/general domain cannot bypass coding, research
-or browser verification. Unrecovered failed/denied general actions remain partial.
-
-## Headless API and saved sessions
-
-Import `SessionController`, `loadConfig` and `parseConfig` from
-`harness-experiment` (or `dist\index.js`). `open`, `inspect`, `submit`,
-`decide`, `cancel`, `continueObjective`, `reconcile`, `listSkills`, `reloadSkills`,
-`subscribe` and `close`
-are the application API. `submit` returns a promise that can remain pending for
-human decisions; service callbacks must not auto-approve it.
-
-The CLI also supports `--headless`. Input is JSON lines with `id`, `operation`,
-and `args`; output types are `response`, `event`, `objective`, and `error`.
-Supported operations: `inspect`, `submit`, `decide`, `cancel`, `continue`,
-`reconcile`, `result`, `events`, `skills`, `grant`, `revoke`, `close`.
-`skills` accepts `{"action":"list"}` (the default) or `{"action":"reload"}`;
-both return the directory and skill metadata without starting model work.
-
-```json
-{"id":"start","operation":"submit","args":{"objective":"Inspect the relevant source","domain":"general"}}
-{"id":"inspect","operation":"inspect"}
-{"id":"skills","operation":"skills","args":{"action":"reload"}}
-```
-
-Copy the current request's `id`, `revision` and `binding` into a trusted human
-`decide` operation, with `answer: "approve"` or `"deny"`. A clarification answer
-uses the same current binding but is not an approval. Keep stdin open while
-interacting; EOF and termination stop owned work and close the session.
+`/clear` resets SDK conversation context while idle; saved native evidence and
+session settings remain. Fresh sessions and supported native resumes use
+`native.db`. Historical stores are unsupported and are not converted or deleted.
 
 ```powershell
 node .\dist\cli.js sessions
-node .\dist\cli.js resume SESSION_ID --data-dir 'D:\harness-data\v2'
+node .\dist\cli.js resume NATIVE_SESSION_ID
 ```
 
-Saved Copilot sessions keep their exact configuration, runtime identity and
-evidence. The default directory remains
-`%LOCALAPPDATA%\harness-experiment\v2`, with `product-v2.db` and the existing
-ownership namespace, so previous sessions remain discoverable and resumable.
-These persisted names do not denote another implementation. Configuration
-formats 2 and 3 remain supported without rewriting saved budgets or digests.
-Existing ignored `harness.v2.local.json` files still work with `--config`.
-The original MVP and legacy-history viewer are removed; historical databases
-are left untouched. Serialized OpenAI checkpoints are not imported, converted
-or passed to Copilot.
+## Headless protocol
 
-## Validation and release gate
+Use `--headless` for bounded JSON-lines messages. Request shape:
 
-`npm run test` runs deterministic policy, SDK/protocol, research, recovery,
-resource and headless-process fixtures. Native terminal verification runs
-separately with `npm run verify:terminal`. Local Docker/browser
-cases are opt-in and explicitly skipped without their prerequisites:
-
-```powershell
-$env:HARNESS_TEST_DOCKER_IMAGE = 'sha256:YOUR_REVIEWED_INSTALLED_IMAGE_ID'
-$env:HARNESS_TEST_BROWSER = 'C:\path\to\chrome.exe'
-$env:HARNESS_TEST_BROWSER_VERSION = 'YOUR_EXACT_FOUR_PART_VERSION'
-npm run test
+```json
+{"id":"trust-1","operation":"trust","args":{"trusted":true}}
+{"id":"permissions-1","operation":"permissions","args":{"mode":"allow-all"}}
+{"id":"mode-1","operation":"mode","args":{"mode":"interactive"}}
+{"id":"auth-1","operation":"auth","args":{"action":"status"}}
+{"id":"submit-1","operation":"submit","args":{"objective":"Inspect this project"}}
 ```
 
-The local coding fixture needs `/bin/sh` and basic utilities in the selected image,
-not a download. It demonstrates a real failing arithmetic check, a focused fix,
-an actual passing check, protected-path/network/privilege boundaries, host
-conflict rejection and separately approved publication.
+Responses and asynchronous events are separate. A submitted objective may await
+a live user decision; service callbacks must not manufacture one.
 
-See [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) for requirement/evidence coverage. On 2026-11-15,
-the exact Globo news request completed against the configured `gpt-6-luna` model
-with a cited report and three supported headlines, using 80,490 of 100,000 tokens.
-On 2026-11-16, the SDK-first implementation passed **151 tests in 23 files**
-with installed Docker/Chromium fixtures, plus native PowerShell/ConPTY and
-clean-package checks. The exact Globo prompt also passes a real-SDK regression
-with synthetic news HTML, three supported headlines, a cited report and 210,000
-cumulative **synthetic reported tokens**, without a product cap. Background
-compaction settlement, summary application, cold resume and cancellation are
-covered by synthetic SDK fixtures. A freshly authorized paid post-implementation
-run also completed the exact Globo prompt with `gpt-6-luna`: **42,730 reported
-tokens, eight model calls, four supported headline records and one verified
-report**. The product remained uncapped; the independent verifier used a
-100,000-token ceiling and 2,048 output tokens per call. The expected redirect
-required a separate approved retrieval. No pending work remained and owned
-cleanup completed. This is bounded live acceptance, not unrestricted paid
-output or provider-capacity verification.
-No live Brave search verification has been run.
-Actual provider compaction under a production context load, exhaustive failure
-injection, native Windows toolchains/egress, browser SPAs/uploads, physical
-clipboard/font observations and complete release acceptance are not claimed.
-The sole default launch is the Copilot implementation; that consolidation does
-not change the remaining A01-A08 release gates or establish complete acceptance.
+Other operations include `inspect`, `skills`, `decide`, `cancel`, `continue`,
+`mcp`, `reconcile`, `result`, `events` and `close`. Decisions bind a live
+ID/revision/binding; stale or interrupted decisions are rejected. `decide` defaults
+to `source: "external"`. A host may label `source: "human_response"` only when it
+actually collected that decision from a person; automated answers must not claim
+human authority.
 
-An opt-in exact-request live verifier is also available:
+## Optional Docker
 
-```powershell
-node --import tsx .\test\news-live-check.ts --allow-spending --max-tokens 100000 --config .\harness.local.json --output-dir 'D:\harness-verification'
-```
+Docker must be explicitly configured with a pinned, installed Linux image.
+Only that tool uses a filtered workspace mirror, no-network container, nonroot
+identity and resource limits. Inspection and hash-bound publication remain
+separate operations. Native shell commands do not inherit Docker isolation.
 
-This performs paid model work only after the explicit flags, uses an empty
-verification workspace and only approves public Globo fetches. It retains the
-answer, source/evidence ledger, usage and runtime state. It requires a completed,
-cited report with at least three supported headline records for this particular
-acceptance case. The general product has no universal three-headline minimum.
-It requires version-3 default mode without product budgets or prompt/output
-overrides. `--max-tokens` is an independent verifier-only ceiling, not product
-configuration; `--max-output-tokens` defaults to 2,048 **only for this opt-in
-verifier**. Both guards are labeled separately in its output and model ledger.
-This bounded check does not demonstrate unrestricted provider output.
-Routine `npm test` never runs this verifier.
+The application never silently changes to Docker or a legacy runtime when native
+execution/authentication fails.

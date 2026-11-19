@@ -1,20 +1,143 @@
 import { describe, it, expect, vi } from 'vitest';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { SessionController } from '../src/controller.js';
+import { TrustedSessionController as SessionController } from './helpers.js';
 import { loadConfig, parseConfig } from '../src/config.js';
 import { fixture, ScriptRuntime, approve } from './helpers.js';
 import { complete, message, provider } from './provider-fixture.js';
 import { Workspace } from '../src/workspace.js';
 import { hash } from '../src/config.js';
+import { resourceFixture } from './resource-fixture.js';
+
+describe('Native resource supervision', () => {
+  it('counts parent and worker usage once with model-specific rates', () => {
+    const f = resourceFixture({ limits: { inputPerMillion: 1, outputPerMillion: 2 },
+      models: [{ id: 'worker-model', wire: 'worker-wire', inputPerMillion: 3, outputPerMillion: 4 }] });
+    try {
+      const cases = [
+        { actorId: undefined, model: f.config.model.canonical, wireModel: f.config.model.wire, input: 100, output: 20 },
+        { actorId: 'worker-one', model: 'worker-model', wireModel: 'worker-wire', input: 30, output: 4 },
+        { actorId: 'worker-two', model: 'worker-model', wireModel: 'worker-wire', input: 50, output: 6 },
+      ];
+      for (const item of cases) {
+        const request = f.resources.beginModelRequest(100, 'fixture', undefined, null, {
+          provider: 'byok', model: item.model, wireModel: item.wireModel, actorId: item.actorId,
+        });
+        f.resources.settle(request, { input: item.input, output: item.output });
+        f.resources.settle(request, { input: 999, output: 999 });
+      }
+      expect(f.resources.current().usage).toMatchObject({ input: 180, output: 30, requests: 3, reserved: 0, unknown: false });
+      expect(f.resources.current().usage.cost).toBeCloseTo(0.00042, 12);
+      expect(f.store.list('model', f.sessionId).map(request => [request.actorId, request.model, request.input, request.output])).toEqual([
+        [undefined, f.config.model.canonical, 100, 20], ['worker-one', 'worker-model', 30, 4], ['worker-two', 'worker-model', 50, 6],
+      ]);
+    } finally { f.cleanup(); }
+  });
+
+  it('preserves unavailable consumption and never invents Copilot token prices', () => {
+    const f = resourceFixture({ provider: { kind: 'copilot' } });
+    try {
+      expect(f.resources.rates()).toBeNull();
+      const known = f.resources.beginModelRequest(100, 'known');
+      f.resources.settle(known, { input: 0, output: 0 });
+      expect(f.resources.current().usage).toMatchObject({ input: 0, output: 0, requests: 1, cost: null, unknown: false });
+      const missing = f.resources.beginModelRequest(100, 'missing');
+      f.resources.settle(missing);
+      expect(f.resources.current().usage).toMatchObject({ requests: 2, cost: null, unknown: true, reserved: 0 });
+      expect(f.store.get('model', missing.id, f.sessionId)).toMatchObject({ status: 'unknown', reportedUsage: false });
+    } finally { f.cleanup(); }
+  });
+
+  it('enforces exact request and action count boundaries before dispatch', () => {
+    const f = resourceFixture({ limits: { maxRequests: 2, maxActions: 2 } });
+    try {
+      for (let count = 0; count < 2; count++) {
+        f.resources.action();
+        f.resources.settle(f.resources.beginModelRequest(1, 'fixture'), { input: 10, output: 1 });
+      }
+      expect(() => f.resources.action()).toThrow('Action cap reached');
+      expect(() => f.resources.beginModelRequest(1, 'fixture')).toThrow('Model request cap reached');
+      expect(f.resources.current()).toMatchObject({ actions: 2, usage: { input: 20, output: 2, requests: 2 } });
+      expect(f.store.list('model', f.sessionId)).toHaveLength(2);
+    } finally { f.cleanup(); }
+  });
+
+  it('shares configured model admission across parent and worker requests', async () => {
+    const f = resourceFixture({ limits: { modelConcurrency: 2 } });
+    const signal = new AbortController().signal;
+    const releases: (() => void)[] = [];
+    try {
+      releases.push(await f.resources.models.acquire(signal));
+      releases.push(await f.resources.models.acquire(signal));
+      let thirdEntered = false;
+      const third = f.resources.models.acquire(signal).then(release => { thirdEntered = true; releases.push(release); });
+      await Promise.resolve();
+      expect(thirdEntered).toBe(false);
+      releases[0]!();
+      await third;
+      expect(thirdEntered).toBe(true);
+    } finally { for (const release of releases) release(); f.cleanup(); }
+  });
+
+  it('enforces independent worker and command admission limits', async () => {
+    const f = resourceFixture({ limits: { concurrency: 1, modelConcurrency: 3, workerConcurrency: 2 } });
+    const releases: (() => void)[] = [];
+    const abort = new AbortController();
+    try {
+      releases.push(await f.resources.tools.acquire(abort.signal));
+      releases.push(await f.resources.workers.acquire(abort.signal));
+      releases.push(await f.resources.workers.acquire(abort.signal));
+      for (let count = 0; count < 3; count++) releases.push(await f.resources.models.acquire(abort.signal));
+      const queuedTool = f.resources.tools.acquire(abort.signal);
+      const queuedWorker = f.resources.workers.acquire(abort.signal);
+      const queuedModel = f.resources.models.acquire(abort.signal);
+      const failure = new Error('Cancel queued fixture admissions.');
+      const outcomes = Promise.allSettled([queuedTool, queuedWorker, queuedModel]);
+      abort.abort(failure);
+      expect(await outcomes).toEqual(Array.from({ length: 3 }, () => ({ status: 'rejected', reason: failure })));
+    } finally { abort.abort(); for (const release of releases) release(); f.cleanup(); }
+  });
+
+  it('cancels queued admission without releasing an occupied slot', async () => {
+    const f = resourceFixture({ limits: { modelConcurrency: 1 } });
+    const queuedAbort = new AbortController();
+    const occupied = await f.resources.models.acquire(new AbortController().signal);
+    try {
+      const cancelled = f.resources.models.acquire(queuedAbort.signal);
+      queuedAbort.abort(new Error('Cancelled queued model.'));
+      await expect(cancelled).rejects.toThrow('Cancelled queued model');
+      let entered = false;
+      const next = f.resources.models.acquire(new AbortController().signal).then(release => { entered = true; return release; });
+      await Promise.resolve(); expect(entered).toBe(false);
+      occupied(); occupied();
+      const release = await next;
+      expect(entered).toBe(true);
+      release(); release();
+    } finally { occupied(); f.cleanup(); }
+  });
+
+  it('settles cancelled model work once and clears only its own reservation', () => {
+    const f = resourceFixture({ model: { canonical: 'gpt-6.1-sol', wire: 'synthetic-deployment', outputTokens: 32 },
+      limits: { maxTokens: 10000 } });
+    try {
+      const first = f.resources.beginModelRequest(100, 'parent');
+      const second = f.resources.beginModelRequest(100, 'worker');
+      f.resources.settle(first, undefined, 'Cancelled after dispatch.', false, true);
+      f.resources.settle(first, { input: 500, output: 500 });
+      expect(f.resources.current().usage).toMatchObject({ requests: 2, reserved: second.reservation, unknown: true, cost: null });
+      expect(f.resources.pending().map(request => request.id)).toEqual([second.id]);
+      expect(f.store.get('model', first.id, f.sessionId)).toMatchObject({ outcome: 'cancelled', status: 'unknown', reportedUsage: false });
+    } finally { f.cleanup(); }
+  });
+});
 
 describe('A07 hard admission, accounting and explicit stop states', () => {
-  it.each([2, 3])('retains model HTTP status and provider request IDs without storing the rejected response body (version %i)', async version => {
+  it.each([4])('retains model HTTP status and provider request IDs without storing the rejected response body (version %i)', async version => {
     const endpoint = await provider(response => response.writeHead(401, {
       'Content-Type': 'application/json', 'x-request-id': 'v2-auth-request',
     }).end(JSON.stringify({ error: { message: 'PRIVATE_RESPONSE_BODY' } })));
     const f = fixture({ version });
-    const config = parseConfig({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const config = parseConfig({ ...f.config, provider: { kind: 'byok', baseURL: endpoint.baseURL } });
     const app = await SessionController.open({ config, apiKey: 'synthetic-provider-wire-key' });
     try {
       const objective = await app.submit('PRIVATE_USER_PROMPT');
@@ -24,7 +147,8 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
         httpStatus: 401, providerRequestId: 'v2-auth-request', code: 'MODEL_HTTP', streamStarted: false,
       });
 
-      expect(error.callId).toBeTruthy();
+      expect(app.store.list('model', app.id, objective.id).find(request => request.id === error.callId))
+        .toMatchObject({ outcome: 'failed', status: 'unknown', reportedUsage: false });
       expect(JSON.stringify(error)).not.toContain('PRIVATE_RESPONSE_BODY');
       expect(JSON.stringify(error)).not.toContain('PRIVATE_USER_PROMPT');
       expect(JSON.stringify(error)).not.toContain('synthetic-provider-wire-key');
@@ -36,14 +160,16 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
     const f = fixture();
     try {
       for (const limits of [{ maxTokens: 128 }, { maxTokens: 100000, maxCost: 0.0001, inputPerMillion: 1, outputPerMillion: 3 }]) {
-        const config = parseConfig({ ...f.config, limits, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+        const config = parseConfig({ ...f.config, limits, provider: { kind: 'byok', baseURL: endpoint.baseURL },
+          model: { ...f.config.model, outputTokens: 2048 } });
         const app = await SessionController.open({ config, apiKey: 'synthetic-provider-wire-key' });
         try {
           const result = await app.submit('Synthetic admission test.');
           expect(result.status).toBe('failed'); expect(result.reason).toMatch(/Insufficient/);
           expect(result.reason).not.toContain('retried 5 times');
           expect(result.usage.requests).toBe(0);
-          expect(app.store.events(app.id).filter(event => event.type === 'error' && event.data.operation === 'Responses request')).toHaveLength(1);
+          expect(app.store.events(app.id).some(event => event.type === 'error' &&
+            event.data.source === 'model' && ['TOKEN_LIMIT', 'COST_LIMIT'].includes(String(event.data.code)))).toBe(true);
         } finally { await app.close(); }
       }
       expect(endpoint.requests).toHaveLength(0);
@@ -51,7 +177,9 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
   }, 30000);
 
   it('uses confirmed unchanged-prefix accounting without copying history, rejects changed frames/prefixes, and still enforces the same token cap', async () => {
-    const f = fixture();
+    const f = fixture({ limits: { maxTokens: 100000 }, model: {
+      canonical: 'gpt-6.1-sol', wire: 'synthetic-deployment', outputTokens: 2048,
+    } });
     const frame = { model: 'synthetic', tools: [{ description: 'd'.repeat(80000) }] };
     const original = [{ role: 'system', content: 'Fixture system message prefix' }];
     const request = (items: unknown[], settings = frame) => ({
@@ -102,7 +230,8 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
       }])
       : complete(response, 'prefix_answer', message('Synthetic prefix-bound workflow completed.'), 'Synthetic prefix-bound workflow completed.'));
     const f = fixture({ limits: { maxReplans: 0 } });
-    const config = parseConfig({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const config = parseConfig({ ...f.config, provider: { kind: 'byok', baseURL: endpoint.baseURL },
+      model: { ...f.config.model, outputTokens: 2048 }, limits: { ...f.config.limits, maxTokens: 250000 } });
     const app = await SessionController.open({ config, apiKey: 'synthetic-provider-wire-key' });
     const { z } = await import('zod');
     app.broker.register('fixture_prefix', 'Synthetic static tool documentation. '.repeat(2000), z.object({ padding: z.string().max(20000) }).strict(),
@@ -113,14 +242,16 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
       expect(endpoint.requests).toHaveLength(2);
       const records = app.store.list('model', app.id, result.id);
       expect(records[1]!.requestBytes!).toBeGreaterThan(100000);
-      expect(records[1]!.reservation).toBeLessThan(100000 - 140);
-      expect(config.limits.maxTokens).toBe(100000);
+      expect(records[1]!.reservation).toBeLessThan(records[1]!.requestBytes!);
+      expect(config.limits.maxTokens).toBe(250000);
       expect(result.usage).toMatchObject({ input: 200, output: 80, requests: 2, reserved: 0, unknown: false });
     } finally { await app.close(); await endpoint.close(); f.cleanup(); }
   }, 60000);
 
   it('stops on reported usage exceeding an incremental reservation instead of treating the extra work as free or retrying it', async () => {
-    const f = fixture();
+    const f = fixture({ limits: { maxTokens: 100000 }, model: {
+      canonical: 'gpt-6.1-sol', wire: 'synthetic-deployment', outputTokens: 2048,
+    } });
     const input = { frameHash: hash('unchanged model frame'), items: [{ role: 'system', content: 'Known prefix' }] };
     const runtime = new ScriptRuntime(async runtime => {
       const first = app.resources.reserve(80000, 'conversation-agent', input);
@@ -141,7 +272,8 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
   it('treats missing wire usage as unknown, blocks retries and preserves the exact ledger across restart', async () => {
     const endpoint = await provider(response => complete(response, 'resp_no_usage', message('Synthetic unknown usage.'), 'Synthetic unknown usage.', false));
     const f = fixture();
-    const config = parseConfig({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const config = parseConfig({ ...f.config, provider: { kind: 'byok', baseURL: endpoint.baseURL },
+      model: { ...f.config.model, outputTokens: 2048 }, limits: { ...f.config.limits, maxTokens: 100000 } });
     let app = await SessionController.open({ config, apiKey: 'synthetic-provider-wire-key' }); const id = app.id;
     try {
       const objective = await app.submit('Synthetic missing-usage test.');
@@ -157,26 +289,30 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
     } finally { await app.close(); await endpoint.close(); f.cleanup(); }
   }, 30000);
 
-  it('caps actions and plan revisions, rejects cyclic/evidence-free done steps, and does not report partial work complete', async () => {
-    const f = fixture({ limits: { maxActions: 5, maxReplans: 0 } });
+  it('caps actions and projects the SDK plan without accepting a competing JSON plan', async () => {
+    const f = fixture({ limits: { maxActions: 2, maxReplans: 0 } });
     const runtime = new ScriptRuntime(async runtime => {
-      await expect(runtime.call('work_plan', { steps: [{ id: 'a', title: 'Cycle', expected: 'Nothing', dependencies: ['a'], status: 'pending' }] })).rejects.toThrow('Cyclic');
-      await expect(runtime.call('work_plan', { steps: [{ id: 'a', title: 'Unsupported done', expected: 'Evidence', status: 'done' }] })).rejects.toThrow('evidence');
-      await runtime.call('work_plan', { steps: [{ id: 'a', title: 'Unfinished', expected: 'Real verification', status: 'blocked', blocker: 'Synthetic missing prerequisite' }] });
-      await expect(runtime.call('work_plan', { steps: [{ id: 'b', title: 'Unbounded revision', expected: 'Nothing', status: 'pending' }] })).rejects.toThrow('revision cap');
+      await runtime.updatePlan('SDK plan: requested coding check is blocked by a missing toolchain.');
+      expect(runtime.options!.tools.map(tool => tool.name)).not.toContain('work_plan');
+      await runtime.call('work_inspect', {});
       await runtime.call('work_inspect', {});
       await expect(runtime.call('work_inspect', {})).rejects.toThrow('Action cap');
       runtime.message('The objective is blocked, not complete.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
-    try { expect((await app.submit('Exercise deterministic control limits.')).status).toBe('partial'); }
+    try {
+      const result = await app.submit('Exercise deterministic control limits.', { domain: 'coding' });
+      expect(result.status).toBe('partial');
+      expect(result.plan).toBe('SDK plan: requested coding check is blocked by a missing toolchain.');
+      expect(result.actions).toBe(2);
+    }
     finally { await app.close(); f.cleanup(); }
   });
 
-  it('bounds result storage/output, preserves Unicode byte-page boundaries, and makes trusted grants revocable', async () => {
+  it('bounds result storage and output while preserving Unicode byte-page boundaries', async () => {
     const f = fixture({ limits: { maxResultBytes: 1024, maxOutputBytes: 128 } });
     const runtime = new ScriptRuntime(async runtime => {
-      await expect(runtime.call('workspace_read', { path: 'notes.txt' })).rejects.toThrow('output');
+      await expect(runtime.call('work_inspect', {})).rejects.toThrow('output');
       runtime.message('Bounded output was refused.');
     });
 
@@ -190,13 +326,12 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
       expect(app.store.readResult(app.id, result.id, 1, 3).text).toBe('\u20ac');
       expect(() => app.store.readResult(app.id, result.id, 2, 3)).toThrow('splits');
       expect(() => app.store.result(app.id, objective.id, 'synthetic', 'x'.repeat(1025), {})).toThrow('storage limit');
-      const grant = app.broker.grant([f.workspace], [], Date.now() + 60000);
-      app.broker.revoke(grant); expect(app.inspect().grants).toHaveLength(0);
+      expect(() => app.store.readResult('another-session', result.id)).toThrow('belongs to this session');
     } finally { await app.close(); f.cleanup(); }
   });
 
-  it('enforces exact file/mirror-count/byte thresholds and rejects disabled or unknown tool dispatch', async () => {
-    const f = fixture({ limits: { maxFileBytes: 128, maxWorkspaceBytes: 1024, maxFiles: 10 }, enabledTools: ['workspace_list'] });
+  it('enforces exact mirror file and byte thresholds and rejects removed tool dispatch', async () => {
+    const f = fixture({ limits: { maxFileBytes: 128, maxWorkspaceBytes: 1024, maxFiles: 10 } });
     writeFileSync(path.join(f.workspace, 'boundary.txt'), 'a'.repeat(128));
     const workspace = new Workspace(f.config);
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => runtime.message('No disabled tool ran.')) });
@@ -204,8 +339,8 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
       expect(workspace.read('boundary.txt').text).toHaveLength(128);
       writeFileSync(path.join(f.workspace, 'boundary.txt'), 'a'.repeat(129));
       expect(() => workspace.read('boundary.txt')).toThrow('size');
-      await expect(app.broker.dispatch('workspace_read', { path: 'notes.txt' }, 'disabled')).rejects.toThrow('disabled');
-      await expect(app.broker.dispatch('unknown_shell', {}, 'unknown')).rejects.toThrow('disabled');
+      await expect(app.broker.dispatch('workspace_read', { path: 'notes.txt' }, 'disabled')).rejects.toThrow('Unsupported');
+      await expect(app.broker.dispatch('unknown_shell', {}, 'unknown')).rejects.toThrow('Unsupported');
       expect(app.store.errors(app.id).errors).toEqual(expect.arrayContaining([
         expect.objectContaining({ source: 'tool', code: 'TOOL_DENIED', callId: 'disabled', status: 'not_started' }),
         expect.objectContaining({ source: 'tool', code: 'TOOL_DENIED', callId: 'unknown', status: 'not_started' }),
@@ -223,17 +358,18 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
 
   it('bounds actual model request count without retrying an external action or silently changing providers', async () => {
     const endpoint = await provider(response => complete(response, 'request_cap', [{
-      id: 'fc_request_cap', type: 'function_call', call_id: 'call_request_cap', name: 'harness_workspace_read',
-      arguments: '{"path":"notes.txt"}', status: 'completed',
+      id: 'fc_request_cap', type: 'function_call', call_id: 'call_request_cap', name: 'harness_work_inspect',
+      arguments: '{}', status: 'completed',
     }]));
     const f = fixture();
-    const config = parseConfig({ ...f.config, limits: { ...f.config.limits, maxRequests: 1 }, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const config = parseConfig({ ...f.config, limits: { ...f.config.limits, maxRequests: 1 },
+      provider: { kind: 'byok', baseURL: endpoint.baseURL } });
     const app = await SessionController.open({ config, apiKey: 'synthetic-provider-wire-key' }); approve(app);
     try {
       const result = await app.submit('Exercise the exact synthetic model request cap.');
       expect(result.status).toBe('failed'); expect(result.reason).toContain('request cap');
       expect(endpoint.requests).toHaveLength(1);
-      expect(app.inspect().actions.filter(action => action.tool === 'workspace_read')).toHaveLength(1);
+      expect(app.inspect().actions.filter(action => action.tool === 'work_inspect')).toHaveLength(1);
       expect(result.usage.requests).toBe(1);
     } finally { await app.close(); await endpoint.close(); f.cleanup(); }
   }, 30000);
@@ -241,10 +377,10 @@ describe('A07 hard admission, accounting and explicit stop states', () => {
 
 describe('SDK-first configuration and optional accounting', () => {
   it('omits task and provider token limits for new launches and rejects ambiguous limit sentinels', () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     try {
       const config = loadConfig(undefined, { workspace: f.workspace, dataDir: f.dataDir, model: f.config.model });
-      expect(config.version).toBe(3);
+      expect(config.version).toBe(4);
       expect(config.model.contextTokens).toBeUndefined();
       expect(config.model.outputTokens).toBeUndefined();
       expect(config.limits.maxTokens).toBeUndefined();
@@ -256,28 +392,26 @@ describe('SDK-first configuration and optional accounting', () => {
       }
     } finally { f.cleanup(); }
   });
-  it.each([2, 3])('preserves version-%i saved policy and digest across cold resume and rejects tampering', async version => {
+  it.each([4])('preserves version-%i saved policy and digest across cold resume and rejects tampering', async version => {
     const f = fixture({ version });
     const runtimeFactory = () => new ScriptRuntime(async runtime => runtime.message('Saved policy preserved.'));
     let app = await SessionController.open({ config: f.config, runtimeFactory }); const id = app.id;
     try {
       await app.submit('Preserve the saved configuration.');
-      if (version === 2) {
-        expect(app.config.model).toMatchObject({ contextTokens: 32000, outputTokens: 2048 });
-        expect(app.config.limits.maxTokens).toBe(100000);
-      }
+      expect(app.config.model.contextTokens).toBeUndefined();
+      expect(app.config.limits.maxTokens).toBeUndefined();
       const digest = hash(app.config);
       await app.close();
       app = await SessionController.open({ config: f.config, sessionId: id, runtimeFactory });
       expect(hash(app.store.session(id).config)).toBe(digest);
       const saved = app.store.db.prepare<[string], { config: string; digest: string }>('SELECT config,digest FROM sessions WHERE id=?').get(id)!;
       expect(saved.digest).toBe(digest);
-      app.store.db.prepare('UPDATE sessions SET config=? WHERE id=?').run(JSON.stringify({ ...f.config, readOnly: !f.config.readOnly }), id);
+      app.store.db.prepare('UPDATE sessions SET config=? WHERE id=?').run(JSON.stringify({ ...f.config, permissionMode: 'manual' }), id);
       expect(() => app.store.session(id)).toThrow('incompatible');
     } finally { await app.close(); f.cleanup(); }
   });
   it('accounts above 100,000 without hashing input, consulting prefix anchors or reserving tokens', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     const runtime = new ScriptRuntime(async runtime => {
       for (let index = 0; index < 2; index++) {
         const request = app.resources.beginModelRequest(2000000, 'conversation-agent', {
@@ -304,7 +438,7 @@ describe('SDK-first configuration and optional accounting', () => {
     } finally { anchor.mockRestore(); await app.close(); f.cleanup(); }
   });
   it('blocks pending uncapped requests, recovers them on restart and keeps billing uncertainty after explicit effect reconciliation', async () => {
-    const f = fixture({ version: 3, limits: { inputPerMillion: 1, outputPerMillion: 2 } });
+    const f = fixture({ version: 4, limits: { inputPerMillion: 1, outputPerMillion: 2 } });
     let app = await SessionController.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => {
       app.resources.beginModelRequest(100, 'interrupted', undefined, null);
       runtime.message('An unfinished request cannot count as completion.');

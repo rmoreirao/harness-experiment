@@ -1,14 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import path from 'node:path';
 import { z } from 'zod';
+import { createAttributedPermissionResult, type PermissionRequest, type PermissionRequestResult, type PermissionMode, type AttributedPermissionResult } from '@github/copilot-sdk';
 import { hash } from './config.js';
 import { HarnessError, errorText } from './contracts.js';
 import { errorDiagnostic } from './errors.js';
-import { within } from './files.js';
-import type { Action, Decision, RuntimeTool, AppEvent } from './contracts.js';
+import type { Action, Decision, RuntimeTool, AppEvent, ToolActor } from './contracts.js';
 import type { Store } from './store.js';
 import type { Resources } from './resources.js';
-import { allowsHttpsOrigin, type Config } from './config.js';
+import type { Config } from './config.js';
 
 export interface ToolContext { action: Action; signal: AbortSignal }
 interface Capability {
@@ -16,8 +15,10 @@ interface Capability {
   effect: Action['effect'];
   parse: (value: unknown) => Record<string, unknown>;
   execute: (args: unknown, context: ToolContext) => Promise<unknown>;
-  scope?: (args: Record<string, unknown>) => { paths?: string[]; origins?: string[] };
 }
+
+// SDK permissions authorize invocation. This registry owns only retained domain
+// validation and result storage, not a second tool approval system.
 export class ActionBroker {
   private capabilities = new Map<string, Capability>();
   private waiters = new Map<string, { resolve: (value: string) => void; reject: (error: unknown) => void }>();
@@ -27,108 +28,77 @@ export class ActionBroker {
     private readonly emit: (type: AppEvent['type'], data: Record<string, unknown>) => void) {}
   register<T extends Record<string, unknown>>(name: string, description: string, schema: z.ZodType<T>,
     effect: Action['effect'], execute: (args: T, context: ToolContext) => Promise<unknown> | unknown,
-    scope?: Capability['scope']): void {
+    _scope?: (args: Record<string, unknown>) => { paths?: string[]; origins?: string[] }): void {
     if (this.capabilities.has(name)) throw new HarnessError('TOOL', 'Duplicate capability.');
     const tool: RuntimeTool = {
       name, description, parameters: z.toJSONSchema(schema),
-      invoke: (args, callId, runtimeSignal) => {
-        const task = this.dispatch(name, args, callId, runtimeSignal);
+      invoke: (args, callId, runtimeSignal, actor) => {
+        const task = this.dispatch(name, args, callId, runtimeSignal, actor);
         this.tasks.add(task); void task.finally(() => this.tasks.delete(task)).catch(() => {});
         return task;
       },
     };
-    this.capabilities.set(name, { tool, effect, scope,
+    this.capabilities.set(name, { tool, effect,
       parse: value => schema.parse(value), execute: async (args, context) => execute(schema.parse(args), context) });
   }
-  tools(): RuntimeTool[] {
-    const allowed = this.config.enabledTools;
-    if (allowed?.some(name => !this.capabilities.has(name))) throw new HarnessError('TOOL', 'An enabled tool is unknown or its provider is unavailable.');
-    return [...this.capabilities.values()].filter(capability => !allowed || allowed.includes(capability.tool.name)).map(capability => capability.tool);
+  tools(): RuntimeTool[] { return [...this.capabilities.values()].map(item => item.tool); }
+  get permissionMode(): PermissionMode {
+    return this.store.list('approvalPolicy', this.sessionId)[0]?.mode ?? this.config.permissionMode;
   }
-  get approveAll(): boolean {
-    return this.store.list('approvalPolicy', this.sessionId)[0]?.approveAll ?? false;
+  get approveAll(): boolean { return this.permissionMode === 'allow-all'; }
+  setPermissionMode(mode: PermissionMode): void {
+    this.store.put('approvalPolicy', { id: this.sessionId, sessionId: this.sessionId, mode, approveAll: mode === 'allow-all' });
+    this.emit('state', { permissionMode: mode, approveAll: mode === 'allow-all' });
   }
-  setApproveAll(enabled: boolean): void {
-    const objective = this.store.latest(this.sessionId);
-    const pending = enabled && objective ? this.store.list('decision', this.sessionId, objective.id)
-      .filter(decision => decision.kind === 'approval' && decision.status === 'pending')
-      .map(decision => this.validateDecision(decision.id, decision.revision, decision.binding, 'approve')) : [];
-    this.store.db.transaction(() => {
-      this.store.put('approvalPolicy', { id: this.sessionId, sessionId: this.sessionId, approveAll: enabled });
-      for (const { decision } of pending) this.store.put('decision', { ...decision, status: 'approved', answer: 'approve' });
-    })();
-    for (const { decision, waiter } of pending) {
-      this.waiters.delete(decision.id); waiter.resolve('approve');
-    }
-    this.emit('state', { approveAll: enabled, approvedPending: pending.length });
+  async permission(request: PermissionRequest, invocation: { sessionId: string }): Promise<PermissionRequestResult | AttributedPermissionResult> {
+    const objective = this.resources.check();
+    const decision: Decision = {
+      id: randomUUID(), sessionId: this.sessionId, objectiveId: objective.id, actionId: '',
+      kind: 'approval', revision: 1, binding: hash([invocation.sessionId, request, randomUUID()]),
+      description: `SDK permission request:\n${JSON.stringify(this.store.redactor.value(request), null, 2)}`,
+      status: 'pending', answer: null, runtimeSessionId: invocation.sessionId,
+    };
+    // Requests which reach the callback may require human approval even when the
+    // selected mode is allow-all (for example a managed-policy requirement).
+    const answer = await this.wait(decision, this.signal());
+    const human = this.store.get('decision', decision.id, this.sessionId).decisionSource === 'human_response';
+    const result: PermissionRequestResult = answer === 'approve'
+      ? { kind: 'approve-once', approvedInteractively: human } : { kind: 'reject' };
+    return human
+      ? createAttributedPermissionResult(result, { source: 'human_response', responseCapability: 'interactive', surface: 'sdk', outcome: 'prompted_user' })
+      : result;
   }
-  private permitted(capability: Capability, args: Record<string, unknown>): boolean {
-    if (['metadata', 'internal'].includes(capability.effect)) return true;
-    if (!['read', 'network'].includes(capability.effect) || !capability.scope) return false;
-    if (capability.effect === 'network' && typeof args.url === 'string' && new URL(args.url).search) return false;
-    const scope = capability.scope(args);
-    if (!scope.paths?.length && !scope.origins?.length) return false;
-    return this.store.list('grant', this.sessionId).some(grant =>
-      !grant.revoked && grant.expires > Date.now() &&
-      (scope.paths ?? []).every(file => grant.paths.some(root => within(root, path.resolve(this.config.workspace, file)))) &&
-      (scope.origins ?? []).every(origin => grant.origins.includes(origin)));
-  }
-  async dispatch(name: string, input: unknown, callId: string, runtimeSignal?: AbortSignal): Promise<string> {
+  async dispatch(name: string, input: unknown, callId: string, runtimeSignal?: AbortSignal, actor: ToolActor = {}): Promise<string> {
     let action: Action | undefined;
     try {
       const capability = this.capabilities.get(name);
-      if (!capability || (this.config.enabledTools && !this.config.enabledTools.includes(name))) throw new HarnessError('TOOL_DENIED', 'Unsupported or disabled capability.');
-      if (!callId || callId.length > 200) throw new HarnessError('IDENTITY', 'A bounded runtime tool call identity is required.');
+      if (!capability) throw new HarnessError('TOOL_DENIED', 'Unsupported capability.');
+      if (!callId || callId.length > 1000) throw new HarnessError('IDENTITY', 'A bounded runtime tool call identity is required.');
       const signal = runtimeSignal ? AbortSignal.any([this.signal(), runtimeSignal]) : this.signal();
       signal.throwIfAborted();
       const args = capability.parse(input);
-      if (this.config.readOnly && ['write', 'execute', 'submit'].includes(capability.effect)) throw new HarnessError('READ_ONLY', 'This session is restricted to read-only capabilities.');
       const objective = this.resources.check();
-      const id = hash([this.sessionId, objective.id, callId]);
+      const id = hash([this.sessionId, objective.id, actor.runtimeSessionId ?? 'parent', callId]);
       const argsHash = hash([name, args, capability.effect]);
-      const previous = this.store.list('action', this.sessionId, objective.id).find(action => action.id === id);
-      if (previous) {
-        if (previous.argsHash !== argsHash) throw new HarnessError('IDENTITY', 'A tool call identity was reused with changed arguments.');
-        if (previous.status === 'completed' && previous.resultId) return JSON.stringify(this.store.readResult(this.sessionId, previous.resultId));
-        throw new HarnessError('RECOVERY', 'This action cannot be replayed. Inspect/reconcile its existing record.');
-      }
+      const previous = this.store.list('action', this.sessionId, objective.id).find(item => item.id === id);
+      if (previous) throw new HarnessError('RECOVERY', previous.argsHash === argsHash
+        ? 'Recorded actions are not replayed. Inspect the existing result.'
+        : 'A tool invocation identity was reused with changed arguments.');
       this.resources.action();
       action = {
         id, callId, sessionId: this.sessionId, objectiveId: objective.id, argsHash, args,
-        tool: name, effect: capability.effect, status: 'pending', resultId: null, error: null, created: Date.now(),
+        tool: name, effect: capability.effect, origin: 'custom', ...actor, status: 'pending',
+        resultId: null, error: null, created: Date.now(),
       };
-      this.store.put('action', action);
-      this.emit('action', { action });
-      const approveAll = this.approveAll;
-      const automatic = !approveAll && this.permitted(capability, args);
-      if (!automatic) {
-        const decision: Decision = {
-          id: randomUUID(), sessionId: this.sessionId, objectiveId: objective.id, actionId: id,
-          kind: 'approval', revision: 1, binding: hash([this.sessionId, objective.id, id, argsHash, 1]),
-          description: `${name} (${capability.effect}): ${JSON.stringify(args)}`,
-          status: 'pending', answer: null,
-        };
-        let answer: string;
-        if (approveAll) {
-          this.store.put('decision', { ...decision, status: 'approved', answer: 'approve' });
-          answer = 'approve';
-        } else {
-          answer = await this.wait(decision, signal);
-        }
-        if (answer !== 'approve') {
-          action.status = 'denied'; this.store.put('action', action);
-          throw new HarnessError('DENIED', 'The user denied this exact action; it did not execute.');
-        }
-      }
-      signal.throwIfAborted(); this.resources.check();
-      if (hash([name, capability.parse(args), capability.effect]) !== argsHash) throw new HarnessError('STALE_APPROVAL', 'Action binding changed.');
+      this.store.put('action', action); this.emit('action', { action });
       const release = await this.resources.tools.acquire(signal);
       try {
         signal.throwIfAborted(); this.resources.check();
-        if (automatic && !this.permitted(capability, args)) throw new HarnessError('GRANT_REVOKED', 'The trusted-read grant expired or was revoked before dispatch.');
-        action.status = 'started'; action.started = Date.now(); this.store.put('action', action);
-        this.emit('action', { action });
-        const output = await capability.execute(args, { action, signal: AbortSignal.any([signal, AbortSignal.timeout(this.config.limits.toolTimeoutMs)]) });
+        action.status = 'started'; action.started = Date.now();
+        this.store.put('action', action); this.emit('action', { action });
+        const output = await capability.execute(args, {
+          action, signal: AbortSignal.any([signal, AbortSignal.timeout(this.config.limits.toolTimeoutMs)]),
+        });
         const encoded = JSON.stringify(output ?? null);
         if (Buffer.byteLength(encoded) > this.config.limits.maxOutputBytes) throw new HarnessError('OUTPUT_LIMIT', 'Tool output exceeds its configured limit.');
         const result = this.store.result(this.sessionId, objective.id, id, encoded, { tool: name, callId });
@@ -143,13 +113,13 @@ export class ActionBroker {
       }
       if (action.status === 'pending') action.status = 'denied';
       else if (action.status === 'started') {
-        const knownNoEffect = error instanceof HarnessError && ['STALE_OBSERVATION', 'BROWSER_TARGET', 'BROWSER_COMPATIBILITY', 'EXECUTION_DISABLED', 'UPLOAD_DISABLED', 'PUBLICATION_PRECONDITION'].includes(error.code);
-        const knownRetrievalFailure = action.effect === 'network' && error instanceof HarnessError &&
+        const noEffect = error instanceof HarnessError &&
+          ['STALE_OBSERVATION', 'BROWSER_TARGET', 'BROWSER_COMPATIBILITY', 'EXECUTION_DISABLED', 'UPLOAD_DISABLED', 'PUBLICATION_PRECONDITION'].includes(error.code);
+        const retrieval = action.effect === 'network' && error instanceof HarnessError &&
           ['HTTP', 'CONTENT_TYPE', 'BODY_LIMIT', 'REDIRECT_LIMIT', 'PRIVATE_NETWORK', 'DESTINATION', 'REDIRECT', 'SEARCH_CREDENTIAL', 'SEARCH_COST', 'COST_LIMIT'].includes(error.code);
-        action.status = knownNoEffect || knownRetrievalFailure || ['metadata', 'read', 'internal'].includes(action.effect) ? 'failed' : 'unknown';
+        action.status = noEffect || retrieval || ['metadata', 'read', 'internal'].includes(action.effect) ? 'failed' : 'unknown';
       }
-      action.error = errorText(error);
-      action.finished = Date.now();
+      action.error = errorText(error); action.finished = Date.now();
       action.errorCode = error instanceof HarnessError ? error.code : 'TOOL_FAILED';
       this.store.put('action', action); this.emit('action', {
         action, diagnostic: errorDiagnostic(error, this.store.redactor,
@@ -172,24 +142,19 @@ export class ActionBroker {
           reject: error => { signal.removeEventListener('abort', abort); reject(error); },
         });
         signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) { abort(); return; }
         this.emit('request', { decision });
       });
     } finally {
       const current = this.resources.current();
       if (['awaiting_approval', 'awaiting_input'].includes(current.status)) {
-        const pending = this.store.list('decision', this.sessionId, current.id).filter(request => request.status === 'pending');
-        current.status = pending.some(request => request.kind === 'question') ? 'awaiting_input' : pending.length ? 'awaiting_approval' : 'running';
+        const pending = this.store.list('decision', this.sessionId, current.id).filter(item => item.status === 'pending' && this.waiters.has(item.id));
+        current.status = pending.some(item => item.kind === 'question') ? 'awaiting_input' : pending.length ? 'awaiting_approval' : 'running';
         this.store.put('objective', current);
       }
     }
   }
-  decide(id: string, revision: number, binding: string, answer: string): void {
-    const { decision, waiter } = this.validateDecision(id, revision, binding, answer);
-    decision.status = decision.kind === 'question' ? 'answered' : answer === 'approve' ? 'approved' : 'denied';
-    decision.answer = answer; this.store.put('decision', decision);
-    this.waiters.delete(id); waiter.resolve(answer);
-  }
-  private validateDecision(id: string, revision: number, binding: string, answer: string) {
+  decide(id: string, revision: number, binding: string, answer: string, source: 'human_response' | 'external' = 'external'): void {
     const decision = this.store.get('decision', id, this.sessionId);
     const waiter = this.waiters.get(id);
     if (!waiter || decision.status !== 'pending' || decision.revision !== revision || decision.binding !== binding ||
@@ -199,29 +164,16 @@ export class ActionBroker {
     if (decision.kind === 'question' && (!answer.trim() || (decision.choices?.length && !decision.allowFreeform && !decision.choices.includes(answer)))) {
       throw new HarnessError('DECISION', 'Use a listed answer for this question.');
     }
-    return { decision, waiter };
+    decision.status = decision.kind === 'question' ? 'answered' : answer === 'approve' ? 'approved' : 'denied';
+    decision.answer = answer; decision.decisionSource = source; this.store.put('decision', decision);
+    this.waiters.delete(id); waiter.resolve(answer);
   }
   question(description: string, choices?: string[], allowFreeform = true): Promise<string> {
     const objective = this.resources.check();
-    const decision: Decision = {
+    return this.wait({
       id: randomUUID(), sessionId: this.sessionId, objectiveId: objective.id, actionId: '',
       kind: 'question', revision: 1, binding: randomUUID(), description, choices, allowFreeform, status: 'pending', answer: null,
-    };
-    return this.wait(decision, this.signal());
-  }
-  grant(paths: string[], origins: string[], expires: number): string {
-    if (expires <= Date.now() || expires > Date.now() + 86400000) throw new HarnessError('GRANT', 'Trusted reads expire within 24 hours.');
-    for (const root of paths) if (!within(this.config.workspace, path.resolve(root))) throw new HarnessError('GRANT', 'Read grant escapes the workspace.');
-    for (const origin of origins) if (!allowsHttpsOrigin(this.config.network.origins, origin)) {
-      throw new HarnessError('GRANT', 'Read grants require exact allowed HTTPS origins; a wildcard network allowlist does not grant automatic reads.');
-    }
-    const id = randomUUID();
-    this.store.put('grant', { id, sessionId: this.sessionId, paths: paths.map(root => path.resolve(root)), origins, expires, revoked: false });
-    this.emit('state', { grantId: id, paths, origins, expires }); return id;
-  }
-  revoke(id: string): void {
-    const grant = this.store.get('grant', id, this.sessionId);
-    grant.revoked = true; this.store.put('grant', grant); this.emit('state', { revokedGrant: id });
+    }, this.signal());
   }
   async drain(): Promise<void> { await Promise.allSettled([...this.tasks]); }
 }

@@ -1,12 +1,12 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 if (process.platform !== 'win32') throw new Error('Package verification targets Windows.');
 const root = mkdtempSync(path.join(tmpdir(), 'harness-package-'));
-const packageFile = process.argv[2] ?? readdirSync(process.cwd()).find(p => /^harness-experiment-\d.*\.tgz$/.test(p));
-if (!packageFile) throw new Error('Build and npm pack the project before running verify:package.');
+const packageFile = process.argv[2] ?? 'harness-experiment-0.2.0.tgz';
+if (!existsSync(packageFile)) throw new Error('Build and npm pack native version 0.2.0 before running verify:package.');
 const packagePath = path.resolve(packageFile);
 if (/["%\r\n]/.test(root + packagePath)) throw new Error('Unsafe package-test path.');
 try {
@@ -17,15 +17,15 @@ try {
   execFileSync(process.execPath, [npmCli, 'install', '--prefix', root, '--omit=dev', '--no-audit', '--no-fund', packagePath],
   { encoding: 'utf8', env, timeout: 180000, stdio: 'pipe' });
   const directory = path.join(root, 'node_modules', 'harness-experiment');
-  const manifest: { bin: Record<string, string>; exports: Record<string, string>; dependencies: Record<string, string> } =
+  const manifest: { version: string; bin: Record<string, string>; exports: Record<string, string>; dependencies: Record<string, string> } =
     JSON.parse(readFileSync(path.join(directory, 'package.json'), 'utf8'));
-  if (Object.keys(manifest.bin).join() !== 'harness' || !['./dist/cli.js', 'dist/cli.js'].includes(manifest.bin.harness ?? '') ||
+  if (manifest.version !== '0.2.0' || Object.keys(manifest.bin).join() !== 'harness' || !['./dist/cli.js', 'dist/cli.js'].includes(manifest.bin.harness ?? '') ||
       Object.keys(manifest.exports).join() !== '.' || manifest.exports['.'] !== './dist/index.js' ||
       '@openai/agents' in manifest.dependencies || 'openai' in manifest.dependencies) {
     throw new Error('Installed package must expose only the promoted CLI/API and no retired backend dependencies.');
   }
   for (const file of ['.env.example', 'harness.example.json', 'README.md', 'docs\\GUIDE.md',
-    'PRODUCT.md', 'ARCHITECTURE.md', 'IMPLEMENTATION_PLAN.md', 'SDK_FIRST_LIMITS_PLAN.md']) {
+    'PRODUCT.md', 'ARCHITECTURE.md', 'IMPLEMENTATION_PLAN.md', 'SDK_FIRST_LIMITS_PLAN.md', 'NATIVE_SDK_MIGRATION_PLAN.md']) {
     if (!existsSync(path.join(directory, file))) throw new Error(`Missing installed example/documentation: ${file}`);
   }
   for (const file of ['.env', 'harness.local.json', 'harness.v2.local.json', 'harness.v2.example.json',
@@ -35,7 +35,7 @@ try {
   }
   const cli = path.join(directory, 'dist', 'cli.js');
   const version = execFileSync(process.execPath, [cli, '--version'], { encoding: 'utf8', env, cwd: root });
-  if (!version.includes('0.1.0') || !version.includes('SDK 1.0.34') || !version.includes('runtime 1.0.112')) {
+  if (!version.includes('0.2.0') || !version.includes('SDK 1.0.34') || !version.includes('runtime 1.0.112')) {
     throw new Error('Installed CLI version/runtime pin check failed.');
   }
   const help = execFileSync(process.execPath, [cli, '--help'], { encoding: 'utf8', env, cwd: root });
@@ -72,15 +72,16 @@ try {
     });
     await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
     const base=JSON.parse(process.argv[1]);
-    const config=parseConfig({...base,model:{baseURL:'http://127.0.0.1:'+server.address().port+'/v1',canonical:'gpt-6.1-sol',wire:'synthetic-deployment'}});
-    let app=await SessionController.open({config,apiKey:'synthetic-installed-package-key'});
+    const config=parseConfig({...base,provider:{kind:'byok',baseURL:'http://127.0.0.1:'+server.address().port+'/v1'},
+      model:{canonical:'gpt-6.1-sol',wire:'synthetic-deployment'}});
+    let app=await SessionController.open({config,trusted:true,apiKey:'synthetic-installed-package-key'});
     try{
       const result=await app.submit('Synthetic installed package verification.');
       if(result.status!=='completed'||result.usage.input!==10||calls!==1)throw new Error(JSON.stringify(result));
       if(config.limits.maxTokens!==undefined||wire.max_output_tokens!==undefined||app.inspect().budget.mode!=='none')throw new Error('SDK-first installed defaults were overridden.');
       const saved=app.store.session(app.id);
       await app.close();
-      app=await SessionController.open({config:saved.config,sessionId:saved.id,apiKey:'synthetic-installed-package-key'});
+      app=await SessionController.open({config:saved.config,sessionId:saved.id,trusted:true,apiKey:'synthetic-installed-package-key'});
       if(app.store.session(app.id).runtimeId!==saved.runtimeId||app.inspect().objective.id!==result.id)throw new Error('Installed cold resume lost session identity or evidence.');
       const resumed=await app.submit('Synthetic installed package cold continuation.');
       if(resumed.status!=='completed'||calls!==2)throw new Error(JSON.stringify(resumed));
@@ -91,7 +92,7 @@ try {
   `;
   const dataDir = path.join(root, 'state');
   const id = execFileSync(process.execPath, ['--input-type=module', '-e', script,
-    JSON.stringify({ version: 3, workspace, dataDir })],
+    JSON.stringify({ version: 4, workspace, dataDir })],
   { encoding: 'utf8', env, cwd: root, timeout: 60000, stdio: 'pipe' }).trim();
   const sessions = execFileSync(process.execPath, [cli, 'sessions', '--data-dir', dataDir], { encoding: 'utf8', env, cwd: root });
   if (!sessions.includes(`${id}  saved`)) throw new Error('Installed CLI did not discover the API-created saved session.');

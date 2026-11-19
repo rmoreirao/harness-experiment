@@ -1,17 +1,24 @@
 {
-  "version": 3,
+  "version": 4,
   "workspace": ".",
-  "dataDir": "C:\\Users\\YOUR_USER\\AppData\\Local\\harness-experiment\\v2",
-  "model": {
-    "baseURL": "https://your-endpoint.example/v1",
-    "canonical": "your-canonical-model-identifier",
-    "wire": "your-deployment-identifier",
-    "wireAPI": "responses"
+  "dataDir": "C:\\Users\\YOUR_USER\\AppData\\Local\\harness-experiment\\native",
+  "provider": {
+    "kind": "copilot"
   },
-  "readOnly": false,
-  "skillsDirectory": ".github\\skills",
+  "model": {
+    "canonical": "gpt-5.3-codex",
+    "wire": "gpt-5.3-codex"
+  },
+  "models": [],
+  "agents": [],
+  "permissionMode": "allow-all",
+  "taskMode": "interactive",
+  "skillDirectories": [".github\\skills"],
+  "agentDirectories": [".github\\agents"],
+  "hookDirectories": [".github\\hooks"],
+  "mcpServers": {},
   "network": {
-    "origins": [],
+    "origins": ["*"],
     "localFixtureOrigins": [],
     "maxBytes": 5242880,
     "timeoutMs": 15000,
@@ -24,6 +31,8 @@
     "timeoutMs": 600000,
     "toolTimeoutMs": 30000,
     "concurrency": 2,
+    "modelConcurrency": 4,
+    "workerConcurrency": 4,
     "maxFileBytes": 1048576,
     "maxOutputBytes": 1048576,
     "maxResultBytes": 20971520,

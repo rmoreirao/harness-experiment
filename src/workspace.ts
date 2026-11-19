@@ -1,20 +1,20 @@
 import {
-  lstatSync, realpathSync, readdirSync, openSync, fstatSync, closeSync, readFileSync,
+  lstatSync, realpathSync, readdirSync, openSync, fstatSync, closeSync,
   writeFileSync, mkdirSync, renameSync, unlinkSync, existsSync, readSync,
 } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { z } from 'zod';
 import { HarnessError } from './contracts.js';
 import { within } from './files.js';
 import { Ownership } from './ownership.js';
 import type { Config } from './config.js';
-import type { ActionBroker } from './policy.js';
 
 export function digest(content: Buffer | string): string { return createHash('sha256').update(content).digest('hex'); }
 const protectedName = /^(?:\.git|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.copilot|\.npmrc|\.netrc|\.pypirc|credentials(?:\..*)?|secrets?(?:\..*)?|harness\.local\.json|harness\.v2\.local\.json)$/i;
 const generatedName = /^(?:node_modules|dist|build|coverage|\.next|\.venv|vendor)$/i;
+
+// This filtered source mirror belongs only to the optional Docker tool.
+// SDK-native filesystem and shell operations do not use this boundary.
 export class Workspace {
   constructor(readonly config: Config, readonly root = config.workspace) {}
   resolve(input: string, create = false): string {
@@ -107,7 +107,7 @@ export class Workspace {
       if (remove) unlinkSync(file);
       else if (expectedHash === 'new') writeFileSync(file, next, { flag: 'wx' });
       else {
-        const temporary = path.join(path.dirname(file), `.harness-v2-${randomUUID()}.tmp`);
+        const temporary = path.join(path.dirname(file), `.harness-native-${randomUUID()}.tmp`);
         try {
           writeFileSync(temporary, next, { flag: 'wx' });
           if (this.read(input).hash !== expectedHash) throw new HarnessError('STALE_WRITE', 'File changed before publication.');
@@ -133,80 +133,4 @@ export class Workspace {
     }
     return baseline;
   }
-  register(broker: ActionBroker): void {
-    broker.register('workspace_list', 'List filtered source paths; **, * and ? globs. No content is read.', z.object({
-      folder: z.string().default('.'), glob: z.string().max(200).default('**'), offset: z.number().int().min(0).default(0),
-      limit: z.number().int().min(1).max(200).default(100),
-    }).strict(), 'metadata', args => {
-      const regex = new RegExp(`^${args.glob.replaceAll('\\', '/').replace(/[.+^${}()|[\]\\]/g, '\\$&')
-        .replace(/\*\*/g, '\0').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\0\//g, '(?:.*/)?').replace(/\0/g, '.*')}$`);
-      const files = this.files(args.folder).filter(file => regex.test(file.replaceAll('\\', '/')));
-      return { files: files.slice(args.offset, args.offset + args.limit), next: args.offset + args.limit < files.length ? args.offset + args.limit : null };
-    });
-    broker.register('workspace_read', 'Read a bounded UTF-8 source range and its exact version hash.', z.object({
-      path: z.string(), start: z.number().int().min(1).default(1), lines: z.number().int().min(1).max(300).default(100),
-    }).strict(), 'read', args => {
-      const file = this.read(args.path); const lines = file.text.split('\n');
-      return { path: args.path, hash: file.hash, start: args.start, lines: lines.slice(args.start - 1, args.start - 1 + args.lines),
-        next: args.start - 1 + args.lines < lines.length ? args.start + args.lines : null };
-    }, args => ({ paths: [String(args.path)] }));
-    broker.register('workspace_search', 'Literal source-content search, bounded by file and result limits.', z.object({
-      text: z.string().min(1).max(200), folder: z.string().default('.'),
-      offset: z.number().int().min(0).default(0), limit: z.number().int().min(1).max(100).default(30),
-    }).strict(), 'read', args => {
-      const matches: { path: string; line: number; text: string }[] = [];
-      let bytes = 0;
-      for (const file of this.files(args.folder)) {
-        let content;
-        try { content = this.read(file); }
-        catch (error) { if (error instanceof HarnessError && error.code === 'FORMAT') continue; throw error; }
-        bytes += Buffer.byteLength(content.text);
-        if (bytes > this.config.limits.maxWorkspaceBytes) throw new HarnessError('SEARCH_LIMIT', 'Search content limit reached; narrow the folder.');
-        for (const [index, line] of content.text.split('\n').entries()) if (line.includes(args.text)) {
-          matches.push({ path: file, line: index + 1, text: line.slice(0, 1000) });
-          if (matches.length >= args.offset + args.limit + 1) return { matches: matches.slice(args.offset, args.offset + args.limit), next: args.offset + args.limit };
-        }
-      }
-      return { matches: matches.slice(args.offset, args.offset + args.limit), next: null };
-    }, args => ({ paths: [String(args.folder)] }));
-    broker.register('workspace_patch', 'Apply exact unique edits with a hash precondition; delete=true is destructive. Creates require expectedHash=new and content.', z.object({
-      path: z.string(), expectedHash: z.string().regex(/^(new|[a-f0-9]{64})$/),
-      edits: z.array(z.object({ oldText: z.string().min(1), newText: z.string() }).strict()).max(50).default([]),
-      content: z.string().optional(), delete: z.boolean().default(false),
-    }).strict(), 'write', args => this.patch(args.path, args.expectedHash, args.edits, args.content, args.delete));
-  }
-}
-export async function safeGit(scope: Workspace, operation: 'status' | 'diff' | 'log', signal: AbortSignal, maxBytes: number, selected?: string[]): Promise<string> {
-  const workspace = scope.root;
-  const gitEntry = path.join(workspace, '.git');
-  if (!lstatSync(gitEntry).isDirectory() || lstatSync(gitEntry).isSymbolicLink()) throw new HarnessError('GIT', 'Git inspection requires a normal .git directory at the selected root.');
-  if (lstatSync(path.join(gitEntry, 'config')).isSymbolicLink()) throw new HarnessError('GIT_CONFIG', 'Linked repository configuration is not admitted.');
-  const config = readFileSync(path.join(gitEntry, 'config'), 'utf8');
-  if (/\b(?:include|includeIf|fsmonitor|sshCommand|command|textconv|external|worktreeConfig)\b/i.test(config)) {
-    throw new HarnessError('GIT_CONFIG', 'Repository helper/include configuration is not admitted for inspection.');
-  }
-  const env = {
-    SystemRoot: process.env.SystemRoot, PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
-    GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_PAGER: 'cat', GIT_ATTR_NOSYSTEM: '1',
-  };
-  const run = (args: string[]): Promise<string> => new Promise((resolve, reject) => execFile('git', [
-    '--no-pager', `--git-dir=${gitEntry}`, `--work-tree=${workspace}`,
-    '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=', '-c', 'diff.external=', '-c', 'core.attributesFile=',
-    '-c', 'core.untrackedCache=false', ...args,
-  ], { cwd: workspace, env, signal, maxBuffer: maxBytes, windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout)));
-  if (operation === 'status') return run(['status', '--porcelain=v1', '--untracked-files=normal']);
-  if (operation === 'log') return run(['log', '-10', '--no-show-signature', '--format=%h %s']);
-  const paths = (await run(['diff', '--name-only', '-z', '--no-ext-diff', '--no-textconv'])).split('\0').filter(Boolean).filter(file => {
-    try {
-      scope.resolve(file, true);
-      if (existsSync(path.join(workspace, file))) scope.read(file);
-      return !selected || selected.includes(file) || selected.includes(file.replaceAll('/', '\\'));
-    } catch (error) {
-      if (error instanceof HarnessError && ['PROTECTED', 'SCOPE', 'FORMAT', 'PATH'].includes(error.code)) return false;
-      throw error;
-    }
-  });
-  if (!paths.length) return 'No admitted source-text diff. Credential, generated, binary, and linked paths are excluded.';
-  if (paths.join(' ').length > 24000) throw new HarnessError('GIT_LIMIT', 'Diff path limit reached; select fewer paths.');
-  return run(['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--', ...paths]);
 }

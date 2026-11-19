@@ -7,10 +7,10 @@ import { fixture } from './helpers.js';
 
 describe('Live news verification authority', () => {
   it.each([
-    { version: 2 },
-    { version: 3, limits: { maxTokens: 100000 } },
-    { version: 3, model: { baseURL: 'http://127.0.0.1:9/v1', canonical: 'synthetic', wire: 'synthetic', outputTokens: 2048 } },
-  ])('does not silently remove explicit product policies to produce a default-mode verification: %j', overrides => {
+    { label: 'token budget', overrides: { version: 4, limits: { maxTokens: 100000 } } },
+    { label: 'currency budget', overrides: { version: 4, limits: { maxCost: 1, inputPerMillion: 1, outputPerMillion: 2 } } },
+    { label: 'output override', overrides: { version: 4, model: { canonical: 'synthetic', wire: 'synthetic', outputTokens: 2048 } } },
+  ])('does not silently remove explicit $label for default-mode verification', ({ overrides }) => {
     const f = fixture(overrides);
     const config = path.join(f.directory, 'config.json'); writeFileSync(config, JSON.stringify(f.config));
     const output = path.join(f.directory, 'verification');

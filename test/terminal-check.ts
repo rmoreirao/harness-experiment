@@ -13,19 +13,22 @@ const nativeQuestion = `NATIVE_QUESTION_START ${'Confirm the intended source bef
 const endpoint = await provider((response, _body, count) => {
   if (count === 3 || count === 4) complete(response, `native_read_${count}`, [{
     id: `native_fc_${count}`, type: 'function_call', call_id: `native_call_${count}`,
-    name: 'harness_workspace_read', arguments: '{"path":"notes.txt"}', status: 'completed',
+    name: 'powershell', arguments: JSON.stringify({
+      command: "Get-Content -LiteralPath 'notes.txt'; Set-Content -LiteralPath 'approved-marker.txt' -Value 'Explicitly approved fixture write.'",
+      description: 'Read and write the disposable terminal fixture only after SDK approval.', initial_wait: 30,
+    }), status: 'completed',
   }]);
   else if (count === 6) complete(response, 'native_question', [{
     id: 'native_question_fc', type: 'function_call', call_id: 'native_question_call',
-    name: 'harness_work_question', arguments: JSON.stringify({
-      question: nativeQuestion, choices: ['Use the stated source', 'Provide another source'], allowFreeform: false,
+    name: 'ask_user', arguments: JSON.stringify({
+      question: nativeQuestion, choices: ['Use the stated source', 'Provide another source'],
     }), status: 'completed',
   }]);
   else complete(response, `native_response_${count}`, message('Synthetic native terminal result.'), 'Synthetic native terminal result.');
 });
-const f = fixture({ version: 3 });
+const f = fixture({ version: 4 });
 const config = path.join(f.directory, 'config.json');
-writeFileSync(config, JSON.stringify({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } }));
+writeFileSync(config, JSON.stringify({ ...f.config, provider: { kind: 'byok', baseURL: endpoint.baseURL } }));
 const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
 class Terminal {
@@ -35,12 +38,12 @@ class Terminal {
   exited = false;
   private listeners = new Set<() => void>();
   constructor(resume?: string) {
-    const args = resume ? ['resume', resume, '--data-dir', f.dataDir] : ['--config', config];
+    const args = resume ? ['resume', resume, '--data-dir', f.dataDir, '--trust-workspace'] : ['--config', config, '--trust-workspace'];
     this.child = pty.spawn('pwsh.exe', ['-NoLogo', '-NoProfile', '-Command',
       `Write-Output 'Synthetic prior terminal output.'; & ${[process.execPath, cli, ...args].map(quote).join(' ')}`], {
       name: 'xterm-256color', cols: 100, rows: 35, cwd: f.workspace,
       env: { ...process.env, FORCE_COLOR: '0', OPENAI_API_KEY: 'synthetic-provider-wire-key',
-        OPENAI_BASE_URL: endpoint.baseURL, HARNESS_MODEL: 'gpt-6.1-sol', HARNESS_WIRE_MODEL: 'synthetic-deployment' },
+        HARNESS_PROVIDER: 'byok', OPENAI_BASE_URL: endpoint.baseURL, HARNESS_MODEL: 'gpt-6.1-sol', HARNESS_WIRE_MODEL: 'synthetic-deployment' },
     });
     this.screen.onData(data => this.child.write(data));
     this.child.onData(data => { this.output += data; this.screen.write(data, () => { for (const listener of this.listeners) listener(); }); });
@@ -57,7 +60,9 @@ class Terminal {
     });
   }
   async send(text: string): Promise<void> {
-    this.output = ''; this.child.write(`\x1b[200~${text}\x1b[201~`); await this.wait(`> ${text}|`);
+    this.output = ''; this.child.write(`\x1b[200~${text}\x1b[201~`);
+    const tail = text.slice(-Math.min(20, this.screen.cols - 4));
+    await this.waitScreen(text.length < this.screen.cols - 4 ? `> ${text}|` : `${tail}|`);
     this.output = ''; this.child.write('\r'); await this.wait('> |');
   }
   lines(): string[] {
@@ -115,7 +120,7 @@ class Terminal {
   async exit(force = false): Promise<void> {
     if (this.exited) return;
     const done = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Terminal did not stop its owned work.')), 10000);
+      const timer = setTimeout(() => reject(new Error(`Terminal PID ${this.child.pid} did not stop its owned work.\n${stripVTControlCharacters(this.output).slice(-6000)}`)), 10000);
       this.child.onExit(() => { clearTimeout(timer); resolve(); });
     });
     if (force) this.child.kill(); else this.child.write('\x04');
@@ -136,7 +141,7 @@ try {
   first.child.write('\x1b[200~Synthetic first line\r\nSynthetic second line\x1b[201~');
   await first.wait('Synthetic second line');
   if (endpoint.requests.length) throw new Error('Paste submitted without Enter.');
-  first.child.write('\r'); await first.wait('completed | 0/0 steps'); await first.wait('Synthetic native terminal result.');
+  first.child.write('\r'); await first.wait('completed | 0 active workers'); await first.wait('Synthetic native terminal result.');
   const beforeTrace = endpoint.requests.length;
   await first.send('/trace on'); await first.waitScreen('> Trace |');
   await first.waitMouse(true);
@@ -173,17 +178,29 @@ try {
   await first.waitMouse(false);
   if (String(first.screen.buffer.active.type) !== 'normal') throw new Error('Trace did not restore the normal terminal screen.');
   if (endpoint.requests.length !== beforeTrace) throw new Error('Trace display commands invoked the model.');
-  await second.send('Synthetic independent second terminal.'); await second.wait('completed | 0/0 steps'); await second.exit();
+  await second.send('Synthetic independent second terminal.'); await second.wait('completed | 0 active workers'); await second.exit();
   first.resize(76, 30);
   await first.send('Read the synthetic notes.'); await first.wait('APPROVAL REQUIRED');
   await first.exit();
   first = start(id); await first.wait('recovery_required');
-  await first.send('/reconcile {"note":"Stopped before dispatch; no side effects."}');
+  const recovery = new Store(f.dataDir);
+  let resolution;
+  try {
+    const objective = recovery.latest(id)!;
+    resolution = { note: 'Inspected the interrupted fixture command; no effects are replayed.',
+      actions: recovery.list('action', id, objective.id).filter(action => ['started', 'unknown'].includes(action.status))
+        .map(action => ({ id: action.id, note: 'The exact disposable fixture command was inspected after cancellation.' })),
+      workers: recovery.list('worker', id, objective.id).filter(worker => ['running', 'unknown'].includes(worker.status))
+        .map(worker => ({ id: worker.id, note: 'The exact disposable worker was inspected after cancellation.' })),
+    };
+  } finally { recovery.close(); }
+  await first.send(`/reconcile ${JSON.stringify(resolution)}`);
   await first.wait('partial');
   await first.send('/continue'); await first.wait('APPROVAL REQUIRED');
-  await first.send('/approve'); await first.wait('completed | 0/0 steps');
+  await first.send('/approve'); await first.wait('completed | 0 active workers');
   await first.wait('Synthetic native terminal result.');
-  await first.send('/trace on'); await first.waitScreen('v Trace |');
+  await first.send('/trace on'); await first.waitScreen('> Trace |');
+  await first.click('> Trace |'); await first.waitScreen('v Trace |');
   first.resize(60, 26);
   await first.click('v Trace |'); await first.waitScreen('> Trace |');
   await first.click('> Trace |'); await first.waitScreen('v Trace |');
@@ -199,7 +216,7 @@ try {
   }
   await first.wait('NATIVE_QUESTION_TAIL');
   if (endpoint.requests.length !== beforeInspection) throw new Error('Request inspection invoked the model or answered the question.');
-  await first.send('Provide another source'); await first.wait('completed | 0/0 steps');
+  await first.send('Provide another source'); await first.wait('completed | 0 active workers');
   await first.wait('Synthetic native terminal result.');
   first.child.write('\x1b[5~'); first.child.write('\x1b[6~');
   await first.send('/trace on'); await first.waitMouse(true);
@@ -207,6 +224,9 @@ try {
   await first.waitMouse(false);
   if (String(first.screen.buffer.active.type) !== 'normal') throw new Error('Exit left the trace screen active.');
   console.log('PASS Windows PowerShell/ConPTY with real SDK and synthetic BYOK: independent terminals, duplicate-owner rejection, safe multiline paste, streaming, clickable trace/call accordions and keyboard fallback without extra model calls, mouse mode cleanup, resize, interrupted approval reconciliation, fresh approval after cold resume, wrapped/scrollable clarifications, scroll and owned shutdown. Physical clipboard/font checks remain manual.');
+} catch (error) {
+  console.error('Native terminal verification failed before cleanup:', error);
+  throw error;
 } finally {
   for (const terminal of terminals) await terminal.exit(true);
   await endpoint.close(); f.cleanup();

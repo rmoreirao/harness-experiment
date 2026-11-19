@@ -1,19 +1,14 @@
 import { z } from 'zod';
+import type { PermissionRequest, PermissionRequestResult, PermissionMode, AttributedPermissionResult } from '@github/copilot-sdk';
+import type { SkillInfo } from './skills.js';
+
+export type TaskMode = 'interactive' | 'plan' | 'autopilot';
+export type { PermissionMode };
 
 export const statusSchema = z.enum([
   'preparing', 'running', 'awaiting_approval', 'awaiting_input', 'completed',
   'partial', 'failed', 'cancelled', 'recovery_required',
 ]);
-export const stepSchema = z.object({
-  id: z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/),
-  title: z.string().min(1).max(500),
-  expected: z.string().min(1).max(2000),
-  dependencies: z.array(z.string()).max(50).default([]),
-  status: z.enum(['pending', 'in_progress', 'done', 'blocked']),
-  blocker: z.string().max(2000).optional(),
-  results: z.array(z.string()).max(50).default([]),
-}).strict();
-export type Step = z.infer<typeof stepSchema>;
 export interface Objective {
   id: string;
   sessionId: string;
@@ -23,8 +18,7 @@ export interface Objective {
   status: z.infer<typeof statusSchema>;
   created: number;
   deadline: number;
-  steps: Step[];
-  planRevision: string | null;
+  plan: string | null;
   replans: number;
   actions: number;
   output: string;
@@ -48,6 +42,10 @@ export interface Action {
   error: string | null;
   errorCode?: string;
   cost?: number | null;
+  origin?: 'native' | 'custom';
+  actorId?: string;
+  parentCallId?: string;
+  runtimeSessionId?: string;
   created?: number;
   started?: number;
   finished?: number;
@@ -65,6 +63,8 @@ export interface Decision {
   answer: string | null;
   choices?: string[];
   allowFreeform?: boolean;
+  runtimeSessionId?: string;
+  decisionSource?: 'human_response' | 'external';
 }
 export interface Result {
   id: string; sessionId: string; objectiveId: string;
@@ -98,6 +98,20 @@ export interface ModelRequest {
   started?: number;
   finished?: number;
   outcome?: 'running' | 'completed' | 'failed' | 'cancelled';
+  provider?: 'copilot' | 'byok';
+  model?: string;
+  wireModel?: string;
+  actorId?: string;
+}
+export interface Worker {
+  id: string; sessionId: string; objectiveId: string; name: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'resolved';
+  parentId?: string; callId?: string; model?: string;
+  started: number; finished?: number; error?: string;
+}
+export interface Assignment {
+  id: string; sessionId: string; objectiveId: string; worker: string;
+  paths: string[]; status: 'active' | 'released';
 }
 export type ActivityRecord =
   | { order: number; kind: 'tool'; value: Action }
@@ -111,12 +125,11 @@ export interface ModelLimits {
   providerCapacityVerified: false;
   verification?: { maxTokens: number; outputTokens: number };
 }
-export interface Grant {
-  id: string; sessionId: string;
-  paths: string[]; origins: string[]; expires: number; revoked: boolean;
-}
 export interface ApprovalPolicy {
-  id: string; sessionId: string; approveAll: boolean;
+  id: string; sessionId: string; approveAll: boolean; mode: PermissionMode;
+}
+export interface SessionPolicy {
+  id: string; sessionId: string; trusted: boolean; taskMode: TaskMode;
 }
 export interface ConversationBoundary {
   id: string; sessionId: string; afterObjectiveId: string | null;
@@ -130,8 +143,9 @@ export interface ExecutionRecord {
 }
 export interface Entities {
   objective: Objective; action: Action; decision: Decision; result: Result;
-  source: Source; claim: Claim; model: ModelRequest; grant: Grant; approvalPolicy: ApprovalPolicy; execution: ExecutionRecord;
+  source: Source; claim: Claim; model: ModelRequest; approvalPolicy: ApprovalPolicy; execution: ExecutionRecord;
   conversation: ConversationBoundary;
+  worker: Worker; assignment: Assignment; sessionPolicy: SessionPolicy;
 }
 export interface AppEvent {
   sequence?: number; at?: number; type: 'state' | 'text' | 'action' | 'request' | 'usage' | 'plan' | 'result' | 'error' | 'runtime' | 'context';
@@ -140,14 +154,18 @@ export interface AppEvent {
 }
 export interface RuntimeTool {
   name: string; description: string; parameters: Record<string, unknown>;
-  invoke: (args: unknown, callId: string, signal?: AbortSignal) => Promise<string>;
+  invoke: (args: unknown, callId: string, signal?: AbortSignal, actor?: ToolActor) => Promise<string>;
 }
+export interface ToolActor { actorId?: string; runtimeSessionId?: string; parentCallId?: string }
 export interface RuntimeOptions {
   sessionId: string; resume: boolean; directory: string;
   tools: RuntimeTool[]; signal: AbortSignal;
   emit: (type: AppEvent['type'], data: Record<string, unknown>) => void;
   question: (question: string, choices?: string[], allowFreeform?: boolean) => Promise<string>;
   beforeStop: () => Promise<string | null>;
+  permission: (request: PermissionRequest, invocation: { sessionId: string }) => Promise<PermissionRequestResult | AttributedPermissionResult>;
+  permissionMode: PermissionMode;
+  taskMode: TaskMode;
   onContext?: (limits: ModelLimits) => void;
 }
 export interface Runtime {
@@ -158,6 +176,11 @@ export interface Runtime {
   events(): Promise<unknown[]>;
   abort(): Promise<void>;
   close(): Promise<void>;
+  setPermissionMode(mode: PermissionMode): Promise<PermissionMode>;
+  setTaskMode(mode: TaskMode): Promise<void>;
+  auth(action: 'status' | 'login' | 'advance' | 'cancel', input?: string): Promise<Record<string, unknown>>;
+  mcp(action: 'list' | 'status' | 'login', serverName?: string): Promise<Record<string, unknown>>;
+  listSkills(): Promise<SkillInfo[]>;
 }
 
 export class HarnessError extends Error {

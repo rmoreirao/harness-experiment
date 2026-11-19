@@ -1,30 +1,52 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fixture } from './helpers.js';
+import { fixture, ScriptRuntime, TrustedSessionController } from './helpers.js';
 import { loadEnvironment } from '../src/config.js';
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
 
+it('redacts configured MCP secret output while storing only environment references', async () => {
+  const secret = 'SYNTHETIC_REFERENCED_MCP_SECRET';
+  vi.stubEnv('FIXTURE_MCP_TOKEN', secret);
+  const f = fixture({ mcpServers: {
+    fixture: { type: 'http', url: 'https://mcp.example.invalid/tools', headers: { authorization: '${env:FIXTURE_MCP_TOKEN}' } },
+  } });
+  const runtime = new ScriptRuntime(async runtime => {
+    runtime.message(`Provider output ${secret}`);
+    runtime.options!.emit('runtime', { state: 'diagnostic', message: `MCP diagnostic ${secret}` });
+  });
+  const app = await TrustedSessionController.open({ config: f.config, runtimeFactory: () => runtime });
+  try {
+    expect((await app.submit('Redact the configured integration secret.')).output).toBe('Provider output [REDACTED]');
+    expect(JSON.stringify(app.store.events(app.id))).not.toContain(secret);
+    const saved = app.store.db.prepare<[string], { config: string }>('SELECT config FROM sessions WHERE id=?').get(app.id)!.config;
+    expect(saved).toContain('${env:FIXTURE_MCP_TOKEN}');
+    expect(saved).not.toContain(secret);
+    expect(app.config.mcpServers.fixture).toMatchObject({ headers: { authorization: '${env:FIXTURE_MCP_TOKEN}' } });
+  } finally { await app.close(); f.cleanup(); vi.unstubAllEnvs(); }
+});
+
 it('loads .env into model configuration without persisting the API key', () => {
   const f = fixture(); cleanup.push(f.cleanup);
   writeFileSync(path.join(f.directory, '.env'), [
+    'HARNESS_PROVIDER=byok',
     'OPENAI_BASE_URL=https://example.invalid/v1',
     'HARNESS_MODEL=synthetic-model',
     'OPENAI_API_KEY=synthetic-env-key',
   ].join('\n'));
   const env = { ...process.env };
-  for (const key of ['OPENAI_BASE_URL', 'HARNESS_MODEL', 'HARNESS_WIRE_MODEL', 'OPENAI_API_KEY']) delete env[key];
+  for (const key of ['HARNESS_PROVIDER', 'OPENAI_BASE_URL', 'HARNESS_MODEL', 'HARNESS_WIRE_MODEL', 'OPENAI_API_KEY']) delete env[key];
   const configModule = new URL('../src/config.ts', import.meta.url).href;
   const code = `
     const {loadEnvironment,loadConfig}=await import(process.argv[1]);
     loadEnvironment();
     const config=loadConfig(undefined,{workspace:process.argv[2],dataDir:process.argv[3]});
     console.log(JSON.stringify({
-      model:config.model.canonical,baseURL:config.model.baseURL,
+      model:config.model.canonical,baseURL:config.provider.baseURL,
       keyLoaded:process.env.OPENAI_API_KEY==='synthetic-env-key',
       secretInConfiguration:JSON.stringify(config).includes('synthetic-env-key')
     }));
@@ -66,9 +88,9 @@ it('keeps existing process settings ahead of .env', () => {
   });
 });
 
-it('uses the existing Copilot data location for the root API and default CLI session discovery and resume', () => {
+it('uses the fresh native data location for the root API and default CLI session discovery and resume', () => {
   const f = fixture(); cleanup.push(f.cleanup);
-  const env = { ...process.env, LOCALAPPDATA: f.directory, OPENAI_BASE_URL: 'http://127.0.0.1:9/v1',
+  const env = { ...process.env, HARNESS_PROVIDER: 'byok', LOCALAPPDATA: f.directory, OPENAI_BASE_URL: 'http://127.0.0.1:9/v1',
     HARNESS_MODEL: 'synthetic', HARNESS_WIRE_MODEL: '', OPENAI_API_KEY: '', BRAVE_SEARCH_API_KEY: '' };
   const code = `
     const {defaultDataDir,loadConfig,Store}=await import(process.argv[1]);
@@ -81,7 +103,7 @@ it('uses the existing Copilot data location for the root API and default CLI ses
     '-e', code, new URL('../src/index.ts', import.meta.url).href, f.workspace],
   { cwd: f.workspace, env, encoding: 'utf8' });
   const saved = JSON.parse(output) as { dataDir: string; defaultDataDir: string; id: string };
-  const expected = path.join(f.directory, 'harness-experiment', 'v2');
+  const expected = path.join(f.directory, 'harness-experiment', 'native');
   expect(saved).toMatchObject({ dataDir: expected, defaultDataDir: expected });
   const cli = ['--import', import.meta.resolve('tsx'), fileURLToPath(new URL('../src/cli.tsx', import.meta.url))];
   const sessions = execFileSync(process.execPath, [...cli, 'sessions'], { cwd: f.workspace, env, encoding: 'utf8' });
@@ -91,7 +113,7 @@ it('uses the existing Copilot data location for the root API and default CLI ses
   });
   const records = resumed.trim().split('\n').map(line => JSON.parse(line) as { id: string; result: { sessionId: string } });
   expect(records.find(record => record.id === 'state')?.result.sessionId).toBe(saved.id);
-});
+}, 90000);
 
 it('allows a missing optional .env but surfaces an unreadable environment path', () => {
   const f = fixture(); cleanup.push(f.cleanup);

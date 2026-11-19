@@ -10,12 +10,17 @@ import type { SessionController } from './controller.js';
 import { activityDetail, activityLine, projectActivity } from './activity.js';
 import { traceBlocks, type DisplayLine, type TraceTarget } from './trace-view.js';
 
-export const HELP = `/status /plan /request /back /cancel /continue /clear /exit
+export const HELP = `/trust /status /plan /request /back /cancel /continue /clear /exit
+/trust explicitly trusts this unsandboxed session before workspace hooks, MCP or tools start.
+/permissions manual|assisted|allow-all changes SDK tool permissions.
+/mode interactive|plan|autopilot selects task progression independently of permissions.
+/auth status|login|advance|cancel [INPUT] manages authentication; login may select githubDotCom/proxima.
+/mcp list|status SERVER|login SERVER inspects configured MCP services and starts SDK-owned OAuth.
 /request opens the full pending question or approval scope; PageUp/PageDown scroll; /back returns.
 /clear resets model context, conversation and input history while idle; saved evidence and settings remain.
 /approve or /reject decides the displayed current action only.
-/approve_all approves all pending and future tool calls in this session, including after resume.
-/approve_all off restores per-call approvals. Questions and safety restrictions still apply.
+/approve_all selects SDK allow-all; /approve_all off selects manual approvals.
+Managed-policy requests and questions still require answers. Already executed effects are not undone.
 /inspect RESULT_ID [BYTE_OFFSET] reads a stored result page; binary pages are base64.
 /events [SEQUENCE] inspects a bounded audit page.
 /trace on|off shows or hides inline plan/tool/model activity (off each launch).
@@ -24,10 +29,8 @@ export const HELP = `/status /plan /request /back /cancel /continue /clear /exit
 Click trace > or v to expand/collapse. Ctrl+T focuses traces; arrows select; Space/Enter toggles.
 Mouse reporting is active only with /trace on; /trace off restores normal terminal mouse behavior.
 /errors [BEFORE_ID] lists session errors; /error ERROR_ID inspects one error.
-/grant {"paths":["ABSOLUTE_PATH"],"origins":[],"expires":TIMESTAMP} explicitly enables scoped trusted reads.
-/revoke GRANT_ID removes a trusted-read grant.
-/skills list (or /skills) lists loaded skills; /skills reload refreshes them while idle.
-/reconcile {"note":"checked effects","actions":[],"usage":[]} resolves exact unknown records.
+/skills list (or /skills) lists SDK skills; /skills reload restarts discovery while idle.
+/reconcile {"note":"checked effects","actions":[],"workers":[],"usage":[]} resolves exact unknown records.
 Enter sends; Ctrl+J or Alt+Enter inserts a newline; paste never submits.
 Arrows edit/history; PageUp/PageDown scroll; Ctrl+C cancels; Ctrl+D saves/exits.`;
 
@@ -77,9 +80,11 @@ export function TerminalApp({ controller, domain = 'general', criteria = [], onM
     enabled: boolean; inspecting: boolean; request: boolean; before?: number; last?: number;
     offset: number; maximum: number; pageSize: number; paused: boolean;
   }>({ enabled: false, inspecting: false, request: false, offset: 0, maximum: 0, pageSize: 8, paused: false });
-  const [notice, setNotice] = useState(() => controller.inspect().objective?.reason ?? (controller.inspect().approveAll
+  const [notice, setNotice] = useState(() => controller.inspect().objective?.reason ?? (!controller.inspect().trusted
+    ? 'UNTRUSTED: native commands use your account access. /trust enables workspace configuration and tools.'
+    : controller.inspect().approveAll
     ? 'Session-wide tool approval enabled. Use /approve_all off to restore per-call approvals.'
-    : 'Approval-first. Describe an objective or use /help.'));
+    : 'Describe an objective or use /help.'));
   const [live, setLive] = useState('');
   const [stopping, setStopping] = useState(false);
   const command = useRef<(input: string) => Promise<void>>(async () => {});
@@ -102,11 +107,48 @@ export function TerminalApp({ controller, domain = 'general', criteria = [], onM
     const state = controller.inspect(); const pending = state.pending[0];
     setTraceFocused(false);
     if (input !== '/request') setRequestId(null);
-    if (input === '/exit') { setStopping(true); await controller.close(); exit(); return; }
+    if (input === '/exit') {
+      setStopping(true);
+      try { await controller.close(); exit(); }
+      catch (error) { setStopping(false); throw error; }
+      return;
+    }
     if (input === '/cancel') { launch(controller.cancel(), '/cancel'); return; }
     if (input === '/clear') { await controller.clearContext(); return; }
     if (input === '/help') { setInspector(HELP); setOffset(0); return; }
     if (input === '/status') { setInspector(JSON.stringify(state, null, 2)); setOffset(0); return; }
+    if (input === '/trust') { controller.trust(true); setNotice('Trusted native session. Commands are unsandboxed; permission mode: ' + controller.inspect().permissionMode); return; }
+    if (/^\/permissions(?:\s|$)/.test(input)) {
+      const mode = input.trim().split(/\s+/);
+      if (mode.length !== 2 || !['manual', 'assisted', 'allow-all'].includes(mode[1]!)) throw new Error('Use /permissions manual|assisted|allow-all.');
+      const { z } = await import('zod');
+      await controller.setPermissionMode(z.enum(['manual', 'assisted', 'allow-all']).parse(mode[1]));
+      setNotice(`SDK permission mode: ${controller.inspect().permissionMode}`); return;
+    }
+    if (/^\/mode(?:\s|$)/.test(input)) {
+      const { z } = await import('zod');
+      const parts = input.trim().split(/\s+/);
+      if (parts.length !== 2) throw new Error('Use /mode interactive|plan|autopilot.');
+      await controller.setTaskMode(z.enum(['interactive', 'plan', 'autopilot']).parse(parts[1]));
+      setNotice(`Task mode: ${controller.inspect().taskMode}`); return;
+    }
+    if (/^\/auth(?:\s|$)/.test(input)) {
+      const { z } = await import('zod');
+      const parts = input.trim().split(/\s+/);
+      const action = z.enum(['status', 'login', 'advance', 'cancel']).parse(parts[1] ?? 'status');
+      if (parts.length > 2 && !['login', 'advance'].includes(action)) throw new Error('Only /auth login or /auth advance accepts an explicit input.');
+      const result = await controller.auth(action, parts.length > 2 ? parts.slice(2).join(' ') : undefined);
+      setInspector(JSON.stringify(result, null, 2)); setOffset(0); return;
+    }
+    if (/^\/mcp(?:\s|$)/.test(input)) {
+      const { z } = await import('zod');
+      const parts = input.trim().split(/\s+/);
+      const action = z.enum(['list', 'status', 'login']).parse(parts[1] ?? 'list');
+      if (parts.length > 3 || (action === 'list' ? parts.length > 2 : parts.length !== 3)) {
+        throw new Error('Use /mcp list, /mcp status SERVER or /mcp login SERVER.');
+      }
+      setInspector(JSON.stringify(await controller.mcp(action, parts[2]), null, 2)); setOffset(0); return;
+    }
     if (/^\/trace(?:\s|$)/.test(input)) {
       const [, action, ...extra] = input.trim().split(/\s+/);
       if (!action || extra.length) throw new Error('Use /trace on|off|expand|collapse|older|latest or /trace CALL_ID.');
@@ -131,7 +173,7 @@ export function TerminalApp({ controller, domain = 'general', criteria = [], onM
     }
     const errors = errorInspector(input, controller.store, controller.id);
     if (errors !== null) { setInspector(errors); setOffset(0); return; }
-    if (input === '/plan') { setInspector(JSON.stringify(state.objective?.steps ?? [], null, 2)); setOffset(0); return; }
+    if (input === '/plan') { setInspector(await controller.plan() ?? 'No SDK plan recorded.'); setOffset(0); return; }
     if (input === '/request') {
       setRequestId(pending?.id ?? null); setInspector(pending ? null : 'No pending request.'); setOffset(0); return;
     }
@@ -140,10 +182,10 @@ export function TerminalApp({ controller, domain = 'general', criteria = [], onM
       try {
         const [, action, ...extra] = input.trim().split(/\s+/);
         if (extra.length || (action !== undefined && action !== 'off')) throw new Error('Use /approve_all or /approve_all off.');
-        controller.setApproveAll(action !== 'off');
+        await controller.setApproveAll(action !== 'off');
         setInspector(null);
-        setNotice(action === 'off' ? 'Per-call tool approvals restored. Already approved calls are not revoked.'
-          : 'All pending and future tool calls approved for this session. Questions still require answers. Use /approve_all off to disable.');
+        setNotice(action === 'off' ? 'SDK manual approvals restored. Executed effects are not undone.'
+          : 'SDK allow-all selected. Managed policy and questions still apply. Use /approve_all off to disable.');
         refresh(value => value + 1); return;
       } catch (error) {
         setInspector(`Approval command failed: ${controller.store.redactor.text(errorText(error))}`);
@@ -154,8 +196,8 @@ export function TerminalApp({ controller, domain = 'general', criteria = [], onM
       try {
         const [, action = 'list', ...extra] = input.trim().split(/\s+/);
         if (extra.length || !['list', 'reload'].includes(action)) throw new Error('Use /skills list or /skills reload.');
-        const catalog = action === 'reload' ? controller.reloadSkills() : controller.listSkills();
-        setInspector(`${action === 'reload' ? 'Skills reloaded.\n' : ''}Skills directory: ${catalog.directory}
+        const catalog = action === 'reload' ? await controller.reloadSkills() : await controller.listSkills();
+        setInspector(`${action === 'reload' ? 'SDK skill discovery restarted.\n' : ''}Workspace SDK skills
 Loaded skills: ${catalog.skills.length}
 
 ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.description}`).join('\n\n')}`);
@@ -167,7 +209,7 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
     }
     if (input === '/approve' || input === '/reject') {
       if (!pending || pending.kind !== 'approval') throw new Error('No current live approval.');
-      controller.decide(pending.id, pending.revision, pending.binding, input === '/approve' ? 'approve' : 'deny');
+      controller.decide(pending.id, pending.revision, pending.binding, input === '/approve' ? 'approve' : 'deny', 'human_response');
       setInspector(null); refresh(value => value + 1); return;
     }
     if (input.startsWith('/inspect ')) {
@@ -177,23 +219,18 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
     if (input.startsWith('/events')) {
       setInspector(JSON.stringify(controller.store.events(controller.id, Number(input.slice(7).trim() || 0)), null, 2)); setOffset(0); return;
     }
-    if (input.startsWith('/grant ')) {
-      const { z } = await import('zod');
-      const grant = z.object({ paths: z.array(z.string()), origins: z.array(z.string()), expires: z.number() }).strict().parse(JSON.parse(input.slice(7)));
-      controller.broker.grant(grant.paths, grant.origins, grant.expires); setNotice('Explicit trusted-read grant enabled. /status shows its scope.'); return;
-    }
-    if (input.startsWith('/revoke ')) { controller.broker.revoke(input.slice(8).trim()); setNotice('Trusted-read grant revoked.'); return; }
     if (input.startsWith('/reconcile ')) {
       const { z } = await import('zod');
       const resolution = z.object({
         note: z.string().min(1), actions: z.array(z.object({ id: z.string(), note: z.string().min(1) })).optional(),
+        workers: z.array(z.object({ id: z.string(), note: z.string().min(1) })).optional(),
         usage: z.array(z.object({ id: z.string(), input: z.number().int().nonnegative(), output: z.number().int().nonnegative() })).optional(),
       }).strict().parse(JSON.parse(input.slice(11)));
       await controller.reconcile(resolution); setNotice('Reconciled; /continue retains the original scope and budget.'); return;
     }
     if (input === '/continue') { launch(controller.continueObjective(), '/continue'); return; }
     if (input.startsWith('/')) throw new Error('Unknown command. Use /help.');
-    if (pending?.kind === 'question') { controller.decide(pending.id, pending.revision, pending.binding, input); return; }
+    if (pending?.kind === 'question') { controller.decide(pending.id, pending.revision, pending.binding, input, 'human_response'); return; }
     setLive(''); launch(controller.submit(input, { domain, criteria }), 'submit'); refresh(value => value + 1);
   };
   useEffect(() => controller.subscribe(event => {
@@ -204,8 +241,8 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
       setTraceDisclosure(null); setOpenCalls(new Set()); setTraceFocused(false); setTraceSelection('root');
       setNotice('Context cleared. Saved evidence, files and session settings are unchanged.');
     }
-    if (event.type === 'text' && typeof event.data.delta === 'string') setLive(value => value + event.data.delta);
-    if (event.type === 'text' && typeof event.data.message === 'string') setLive('');
+    if (event.type === 'text' && !event.data.actorId && !event.data.parentCallId && typeof event.data.delta === 'string') setLive(value => value + event.data.delta);
+    if (event.type === 'text' && !event.data.actorId && !event.data.parentCallId && typeof event.data.message === 'string') setLive('');
     if (event.type === 'error') setNotice(errorNotice(event.data));
     if (event.type === 'request' && record(event.data.decision) && event.data.decision.kind === 'question') {
       setNotice('Waiting for input. /request opens the full question.');
@@ -390,9 +427,8 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
   };
   const traceLines: DisplayLine[] = [
     { text: 'TRACE ON' },
-    ...(objective?.steps.length ? ['PLAN', ...objective.steps.map(step =>
-      `${step.status === 'done' ? '[x]' : step.status === 'in_progress' ? '[>]' : step.status === 'blocked' ? '[!]' : '[ ]'} ${step.title}${step.blocker ? ` | ${step.blocker}` : ''}`)]
-      : ['PLAN: not recorded yet']).map(text => ({ text })),
+    ...(state?.workers ?? []).map(worker => ({ text: `WORKER [${worker.status}] ${worker.name} ${worker.id.slice(0, 12)}${worker.model ? ` | ${worker.model}` : ''}${worker.error ? ` | ${worker.error}` : ''}` })),
+    ...(objective?.plan ? ['SDK PLAN', ...objective.plan.split('\n')] : ['SDK PLAN: /plan to inspect live planning']).map(text => ({ text })),
     ...(currentPage === undefined ? [] : [pausedLive ? 'Live following paused | PageDown or /trace latest to follow' :
       'Earlier calls | /trace latest returns to live activity']).map(text => ({ text })),
     ...(activity.next === null ? [] : [{ text: 'More recorded calls: /trace older' }]),
@@ -453,12 +489,12 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
   };
   if (!state) return <Text>Stopping owned work and saving state...</Text>;
   return <Box flexDirection="column" width={frameWidth} height={tracing ? Math.max(1, dimensions.height - 1) : undefined}>
-    <Text bold color="cyan" wrap="truncate-end">HARNESS  {state.model}  {state.sessionId.slice(0, 8)}{tracing ? ' | TRACE ON' : ''}</Text>
+    <Text bold color="cyan" wrap="truncate-end">HARNESS  {state.provider}/{state.model}  {state.sessionId.slice(0, 8)}{tracing ? ' | TRACE ON' : ''}</Text>
     {state.approveAll && <Text bold color="yellow">APPROVE ALL: ENABLED</Text>}
     {!compact && <Text wrap="truncate-end">
-      {terminalText(state.workspace)}{state.readOnly ? ' | read-only restriction' : state.approveAll ? '' : ' | approval-first'}
+      {terminalText(state.workspace)} | {state.trusted ? 'UNSANDBOXED' : 'UNTRUSTED: /trust'} | {state.taskMode} | {state.permissionMode}
     </Text>}
-    <Text wrap="truncate-end">{objective?.status ?? 'idle'} | {objective?.steps.filter(step => step.status === 'done').length ?? 0}/{objective?.steps.length ?? 0} steps | {state.results.length} results | {state.grants.length} read grants</Text>
+    <Text wrap="truncate-end">{objective?.status ?? 'idle'} | {state.workers.filter(worker => worker.status === 'running').length} active workers | {state.results.length} results</Text>
     <Box flexDirection="column" minHeight={viewport}>
       {visible.length ? visible.map((line, index) => <Text key={index} wrap="truncate"
         inverse={traceFocused && line.target !== undefined && line.target.key === selected?.key}>{line.text}</Text>) :
@@ -475,7 +511,7 @@ ${catalog.skills.map(skill => `${skill.name} [${skill.source}]\n${skill.descript
     {!compact && <Text dimColor wrap="truncate-end">
       Usage {objective?.usage.unknown ? `unknown (known ${objective.usage.input + objective.usage.output})` : objective ? objective.usage.input + objective.usage.output : 0}
       {state.budget.maxTokens !== null ? `/${state.budget.maxTokens}` : ' | no task token budget'}
-      {' | '}cost {objective?.usage.cost ?? 'unknown'}{state.budget.maxCost !== null ? `/${state.budget.maxCost}` : ''}
+      {' | '}tracked cost {objective?.usage.cost ?? 'unknown'}{state.budget.maxCost !== null ? `/${state.budget.maxCost}` : ''}
       {' | '}in flight {state.pendingModelRequests}
     </Text>}
     {!compact && <Text dimColor wrap="truncate-end">

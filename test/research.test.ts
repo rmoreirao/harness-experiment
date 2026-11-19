@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { describe, it, expect, vi } from 'vitest';
-import { SessionController } from '../src/controller.js';
+import { TrustedSessionController as SessionController } from './helpers.js';
 import { ProtectedNetwork, publicAddress } from '../src/network.js';
 import { readable } from '../src/research.js';
 import { parseConfig } from '../src/config.js';
@@ -48,10 +48,6 @@ describe('A03/A06 protected retrieval and evidence', () => {
           support: source!.evidence!.map(evidence => ({ sourceId: source!.id, evidenceId: evidence.id })) };
       } else if (count === 3) {
         name = 'research_report'; args = { report: `${reportText} [source:${source!.id}]` };
-      } else if (count === 4) {
-        const result = app.inspect().results.find(result => result.provenance.kind === 'research_report')!;
-        name = 'work_plan'; args = { steps: [{ id: 'news', title: 'Verify the synthetic homepage headlines',
-          expected: 'A cited report with three supported headline records', status: 'done', results: [result.id] }] };
       } else {
         const answer = `${reportText} [source:${source!.id}]`;
         complete(response, 'news_answer', message(answer), answer, { input_tokens: 40000, output_tokens: 2000, total_tokens: 42000 });
@@ -68,15 +64,14 @@ describe('A03/A06 protected retrieval and evidence', () => {
         <h2><a href="https://g1.globo.com/noticia/synthetic-two">Synthetic headline two</a></h2>
         <h2><a href="https://g1.globo.com/noticia/synthetic-three">Synthetic headline three</a></h2></main>`),
     }));
-    const f = fixture({ version: 3, network: { origins: ['*'] } });
-    const config = parseConfig({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const f = fixture({ version: 4, network: { origins: ['*'] } });
+    const config = parseConfig({ ...f.config, provider: { kind: 'byok', baseURL: endpoint.baseURL } });
     const app = await SessionController.open({ config, apiKey: 'synthetic-provider-wire-key' }); approve(app);
     try {
       const before = Date.now();
       const objective = await app.submit('what are latest news on globo.com?');
       expect(objective.status, objective.reason ?? '').toBe('completed');
-      expect(objective.usage).toMatchObject({ input: 200000, output: 10000, requests: 5, reserved: 0, unknown: false });
-      expect(objective.steps).toEqual([expect.objectContaining({ status: 'done' })]);
+      expect(objective.usage).toMatchObject({ input: 160000, output: 8000, requests: 4, reserved: 0, unknown: false });
       expect(app.inspect()).toMatchObject({ budget: { mode: 'none', maxTokens: null, maxCost: null }, pendingModelRequests: 0, pending: [] });
       const source = app.store.list('source', app.id, objective.id)[0]!;
       expect(source.retrieved).toBeGreaterThanOrEqual(before);
@@ -125,8 +120,7 @@ describe('A03/A06 protected retrieval and evidence', () => {
 The homepage announces synthetic cashback news. [source:${source.id}]`;
       await runtime.call('research_report', { report });
       const result = app.inspect().results.find(result => result.provenance.kind === 'research_report')!;
-      await runtime.call('work_plan', { steps: [{ id: 'headlines', title: 'Verify homepage headlines', expected: 'A report supported by exact source evidence',
-        status: 'done', results: [result.id] }] });
+      await runtime.updatePlan(`Verified homepage headline report: ${result.id}`);
       runtime.message(report);
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime }); approve(app);
@@ -152,10 +146,9 @@ The homepage announces synthetic cashback news. [source:${source.id}]`;
       expect(text).toContain(String(claim.text));
       expect(text).toContain(String(claim.uncertainty));
       expect(text).toContain(`[source:${source.id}]`);
-      await expect(runtime.call('work_plan', { steps: [{ id: 'report', title: 'Record report evidence', expected: 'A verified report',
-        status: 'done', results: [claim.id] }] })).rejects.toThrow('not a claim/source ID');
-      await runtime.call('work_plan', { steps: [{ id: 'report', title: 'Record report evidence', expected: 'A verified report',
-        status: 'done', results: [id] }] });
+      await expect(runtime.call('result_read', { id: claim.id })).rejects.toThrow('No result');
+      expect((await runtime.call('result_read', { id })).text).toBe(text);
+      await runtime.updatePlan(`Recorded citation-verified report: ${id}`);
       runtime.message('The fixture overview has canonical source evidence and visible uncertainty.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime }); approve(app);
@@ -178,8 +171,7 @@ The homepage announces synthetic cashback news. [source:${source.id}]`;
       const report = `Latest synthetic headline [source:${source.id}]`;
       await runtime.call('research_report', { report });
       const result = app!.inspect().results.find(result => result.provenance.kind === 'research_report')!;
-      await runtime.call('work_plan', { steps: [{ id: 'news', title: 'Retrieve supported fixture headlines', expected: 'Readable cited news evidence',
-        status: 'done', results: [result.id] }] });
+      await runtime.updatePlan(`Readable cited news evidence: ${result.id}`);
       runtime.message(report);
     });
     try {
@@ -230,8 +222,7 @@ The homepage announces synthetic cashback news. [source:${source.id}]`;
       expect(verification).toMatchObject({ sources: 3, independentOrigins: 2, conflicts: 1 });
       const results = app.inspect().results;
       const reportResult = results.find(result => result.provenance.kind === 'research_report')!;
-      await runtime.call('work_plan', { steps: [{ id: 'report', title: 'Compare retrieved evidence', expected: 'A supported report with the conflict disclosed',
-        status: 'done', dependencies: [], results: [reportResult.id] }] });
+      await runtime.updatePlan(`Compared source evidence and disclosed conflict: ${reportResult.id}`);
       runtime.message(report);
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime }); approve(app);

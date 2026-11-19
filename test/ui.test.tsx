@@ -1,18 +1,33 @@
 import { render } from 'ink-testing-library';
-import { writeFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { TerminalApp } from '../src/ui.js';
-import { SessionController } from '../src/controller.js';
+import { TrustedSessionController as SessionController } from './helpers.js';
 import { HarnessError } from '../src/contracts.js';
 import { z } from 'zod';
-import { fixture, skillFile, ScriptRuntime } from './helpers.js';
+import { fixture, ScriptRuntime } from './helpers.js';
 import { activityDetail, activityLine, foldActivity, projectActivity } from '../src/activity.js';
 import type { Action, ActivityRecord } from '../src/contracts.js';
 
 async function settle() { await new Promise(resolve => setTimeout(resolve, 70)); }
 describe('A08 terminal continuity', () => {
+  it('renders the stopping state without dereferencing worker state during shutdown', async () => {
+    const f = fixture();
+    const app = await SessionController.open({ config: f.config,
+      runtimeFactory: () => new ScriptRuntime(async runtime => runtime.message('Idle fixture.')) });
+    let release!: () => void;
+    const closing = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(app, 'close').mockImplementationOnce(() => closing);
+    const screen = render(<TerminalApp controller={app} />);
+    try {
+      await settle();
+      screen.stdin.write('\x04');
+      await vi.waitFor(() => expect(screen.lastFrame()).toContain('Stopping owned work and saving state'));
+      expect(screen.lastFrame()).not.toContain('Cannot read properties');
+    } finally { release(); screen.unmount(); await app.close(); f.cleanup(); }
+  });
+
   it('expands trace groups and calls with mouse and keyboard without replaying work or losing the draft', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     let calls = 0;
     const runtime = new ScriptRuntime(async runtime => {
       const request = app.resources.beginModelRequest(100, 'fixture-model', undefined, null);
@@ -70,10 +85,10 @@ describe('A08 terminal continuity', () => {
   });
 
   it('maps trace clicks after resize and scrolling without letting clicks decide a pending approval', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     const runtime = new ScriptRuntime(async runtime => {
       for (let index = 0; index < 8; index++) await runtime.call('work_inspect', {});
-      await runtime.call('workspace_read', { path: 'notes.txt' });
+      await runtime.requestPermission('read_file', { path: 'notes.txt' });
       runtime.message('MOUSE_APPROVAL_FINISHED');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
@@ -102,16 +117,16 @@ describe('A08 terminal continuity', () => {
   });
 
   it('wraps the full pending question and choices, prioritizes them over trace history, and pages overflow from the top', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     const question = `QUESTION_START ${'Please confirm the intended news website before continuing. '.repeat(7)} QUESTION_TAIL`;
     const choices = ['Use the intended news website', 'Provide a different URL'];
     const runtime = new ScriptRuntime(async runtime => {
-      const answer = await runtime.call('work_question', { question, choices, allowFreeform: false });
+      const answer = await runtime.options!.question(question, choices, false);
       expect(answer).toBe(choices[1]);
       runtime.message('QUESTION_ANSWERED');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
-    app.setApproveAll(true);
+    await app.setApproveAll(true);
     const screen = render(<TerminalApp controller={app} />);
     const resize = async (columns: number, rows: number) => {
       Object.defineProperties(screen.stdout, { columns: { value: columns, configurable: true }, rows: { value: rows, configurable: true } });
@@ -126,7 +141,7 @@ describe('A08 terminal continuity', () => {
       expect(screen.lastFrame()).toContain('QUESTION_START');
       expect(screen.lastFrame()).toContain('QUESTION_TAIL');
       for (const choice of choices) expect(screen.lastFrame()).toContain(`- ${choice}`);
-      expect(screen.lastFrame()).toContain('[waiting for input] TOOL');
+      expect(screen.lastFrame()).toContain('Waiting for input | /request: full question');
       expect(screen.lastFrame()).not.toContain('[run] TOOL');
       expect(screen.lastFrame()!.split('\n').length).toBeLessThanOrEqual(40);
       const pending = app.inspect().pending[0]!;
@@ -159,7 +174,7 @@ describe('A08 terminal continuity', () => {
       await send('/request');
       expect(screen.lastFrame()).toContain('Request lines 1-');
       expect(app.inspect().pending[0]).toEqual(pending);
-      expect(app.store.list('action', app.id)).toHaveLength(1);
+      expect(app.store.list('action', app.id)).toHaveLength(0);
       expect(app.inspect().objective!.usage.requests).toBe(0);
       await send(choices[1]!); await work;
       expect(app.inspect().pending).toHaveLength(0);
@@ -170,12 +185,12 @@ describe('A08 terminal continuity', () => {
   });
 
   it('keeps multiline Unicode questions readable after resizing without changing approval or answer behavior', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     const unicode = '\u65e5\u672c\u8a9e\u306e\u30cb\u30e5\u30fc\u30b9';
     const question = `Which URL should I use?\n${`${unicode} `.repeat(12)}\nFINAL_QUESTION_LINE`;
     const runtime = new ScriptRuntime(async runtime => {
-      await runtime.call('work_question', { question });
-      await runtime.call('workspace_read', { path: 'notes.txt' });
+      await runtime.options!.question(question);
+      await runtime.requestPermission('read_file', { path: 'notes.txt' });
       runtime.message('READ_APPROVED');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
@@ -197,7 +212,7 @@ describe('A08 terminal continuity', () => {
       expect(app.inspect().pending[0]?.kind).toBe('approval');
       expect(screen.lastFrame()).toContain('APPROVAL REQUIRED');
       await send('/request');
-      expect(screen.lastFrame()).toContain('workspace_read');
+      expect(screen.lastFrame()).toContain('read_file');
       expect(screen.lastFrame()!.replaceAll('\n', '')).toContain('notes.txt');
       expect(app.inspect().pending[0]?.status).toBe('pending');
       await send('/approve'); await work;
@@ -206,7 +221,7 @@ describe('A08 terminal continuity', () => {
   });
 
   it('keeps tracing opt-in, folds overflow, expands without replay, and preserves expansion across live calls', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     let release: (() => void) | undefined; let calls = 0;
     const runtime = new ScriptRuntime(async runtime => {
       for (let index = 0; index < 12; index++) await runtime.call('trace_fixture', { path: `item-${index}`, secret: 'fixture-trace-key' });
@@ -268,11 +283,11 @@ describe('A08 terminal continuity', () => {
   });
 
   it('traces live approvals and settled unknown model usage without changing decisions', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     const runtime = new ScriptRuntime(async runtime => {
       const request = app.resources.beginModelRequest(100, 'fixture-model', undefined, null);
       runtime.options!.emit('runtime', { state: 'model_request', request });
-      await runtime.call('workspace_read', { path: 'notes.txt' });
+      await runtime.requestPermission('read_file', { path: 'notes.txt' });
       app.resources.settle(request);
       runtime.options!.emit('runtime', { state: 'model_request', request });
       runtime.message('TRACE_APPROVAL_FINISHED');
@@ -284,10 +299,10 @@ describe('A08 terminal continuity', () => {
     try {
       await vi.waitFor(() => expect(app.inspect().pending).toHaveLength(1));
       await send('/trace on');
-      expect(screen.lastFrame()).toContain('[wait approval]');
+      expect(screen.lastFrame()).toContain('[run] MODEL');
       expect(screen.lastFrame()).toContain('APPROVAL REQUIRED');
       const pending = app.inspect().pending[0]!;
-      const action = app.trace().items.find(item => item.kind === 'tool')!;
+      const action = app.trace().items.find(item => item.kind === 'model')!;
       await send(`/trace ${action.value.id}`);
       expect(app.inspect().pending[0]).toEqual(pending);
       await send('/trace off');
@@ -302,12 +317,12 @@ describe('A08 terminal continuity', () => {
       expect(app.inspect().pending).toHaveLength(0);
       await send('/trace nonsense extra');
       expect(screen.lastFrame()).toContain('Use /trace');
-      expect(app.store.list('action', app.id)).toHaveLength(1);
+      expect(app.store.list('action', app.id)).toHaveLength(0);
     } finally { screen.unmount(); await app.close(); f.cleanup(); }
   });
 
   it('pages history, keeps an older active model visible, and restores recorded calls without stale state after resume', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     let release: (() => void) | undefined; let calls = 0;
     const runtime = new ScriptRuntime(async runtime => {
       const request = app.resources.beginModelRequest(100, 'fixture-model', undefined, null);
@@ -366,7 +381,7 @@ describe('A08 terminal continuity', () => {
       const old = app.inspect().objective!;
       const error = app.store.event({ type: 'error', sessionId: app.id, objectiveId: old.id,
         data: { message: 'HISTORICAL_ERROR', code: 'FIXTURE' } });
-      app.setApproveAll(true);
+      await app.setApproveAll(true);
       await send('/status');
       await send('/clear');
       expect(screen.lastFrame()).toContain('Context cleared.');
@@ -392,7 +407,7 @@ describe('A08 terminal continuity', () => {
 
   describe('inline trace projection', () => {
     it('folds only contiguous older successes, retaining the newest success and every unsafe or active outcome', () => {
-      const f = fixture({ version: 3 });
+      const f = fixture({ version: 4 });
       try {
         const statuses: Action['status'][] = ['completed', 'completed', 'failed', 'completed', 'completed', 'started', 'denied', 'unknown', 'completed'];
         const records: ActivityRecord[] = statuses
@@ -416,7 +431,7 @@ describe('A08 terminal continuity', () => {
     });
 
     it('does not present missing accounting or interrupted requests as active or invent historical timing', () => {
-      const f = fixture({ version: 3 });
+      const f = fixture({ version: 4 });
       try {
         const record: ActivityRecord = { order: 1, kind: 'model', value: {
           id: 'a'.repeat(32), sessionId: 's', objectiveId: 'o', input: 0, output: 0, reservation: 0,
@@ -436,7 +451,7 @@ describe('A08 terminal continuity', () => {
   it('rejects clear during a live approval without losing the conversation or approving the call', async () => {
     const f = fixture();
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => {
-      await runtime.call('workspace_read', { path: 'notes.txt' });
+      await runtime.requestPermission('read_file', { path: 'notes.txt' });
       runtime.message('Preserved conversation.');
     }) });
     const screen = render(<TerminalApp controller={app} />);
@@ -446,7 +461,7 @@ describe('A08 terminal continuity', () => {
       await send('WAITING_USER_CONTEXT');
       const runtimeId = app.runtimeId;
       await send('/clear');
-      expect(screen.lastFrame()).toContain('Context can only be cleared while idle');
+      expect(screen.lastFrame()).toContain('Finish or reconcile the current objective first');
       expect(screen.lastFrame()).toContain('WAITING_USER_CONTEXT');
       expect(screen.lastFrame()).toContain('APPROVAL REQUIRED');
       expect(app.inspect().pending).toHaveLength(1);
@@ -459,7 +474,7 @@ describe('A08 terminal continuity', () => {
   });
 
   it('distinguishes uncapped usage, unknown billing and current context/output provenance', async () => {
-    const f = fixture({ version: 3 });
+    const f = fixture({ version: 4 });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => {
       app.resources.settle(app.resources.beginModelRequest(200, 'synthetic', undefined, null));
       runtime.message('A verified answer with unknown billing.');
@@ -544,10 +559,9 @@ describe('A08 terminal continuity', () => {
     } finally { await app.close(); f.cleanup(); }
   });
   it('enables session-wide approval from the command, shows the mode, and can restore approval prompts', async () => {
-    const f = fixture();
+    const f = fixture({ permissionMode: 'manual' });
     const runtime = new ScriptRuntime(async runtime => {
-      await runtime.call('workspace_read', { path: 'notes.txt' });
-      await runtime.call('workspace_read', { path: 'notes.txt' });
+      if (runtime.options!.permissionMode !== 'allow-all') await runtime.requestPermission('read_file', { path: 'notes.txt' });
       runtime.message('Synthetic session-approved work.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
@@ -558,6 +572,8 @@ describe('A08 terminal continuity', () => {
       await send('Read synthetic notes.');
       expect(screen.lastFrame()).toContain('APPROVAL REQUIRED');
       await send('/approve_all');
+      expect(app.inspect().pending).toHaveLength(1);
+      await send('/approve');
       expect(app.inspect().objective?.status).toBe('completed');
       expect(app.inspect().approveAll).toBe(true);
       expect(screen.lastFrame()?.split('\n')).toContain('APPROVE ALL: ENABLED');
@@ -585,7 +601,7 @@ describe('A08 terminal continuity', () => {
     let app = await SessionController.open({ config: f.config, runtimeFactory });
     const id = app.id;
     try {
-      app.setApproveAll(true);
+      await app.setApproveAll(true);
       await app.close();
       app = await SessionController.open({ config: f.config, sessionId: id, runtimeFactory });
       const screen = render(<TerminalApp controller={app} />);
@@ -597,10 +613,13 @@ describe('A08 terminal continuity', () => {
     } finally { await app.close(); f.cleanup(); }
   });
 
-  it('lists skills, reloads edits/additions and exposes reload errors without losing the previous snapshot', async () => {
+  it('lists the effective SDK skills and exposes reload errors without inventing snapshots', async () => {
     const f = fixture();
-    const file = skillFile(f.workspace, 'review-notes', 'Original guidance.');
-    const app = await SessionController.open({ config: f.config, runtimeFactory: () => new ScriptRuntime(async runtime => runtime.message('Synthetic completed objective.')) });
+    const runtime = new ScriptRuntime(async runtime => runtime.message('Synthetic completed objective.'));
+    let catalog = [{ name: 'review-notes', description: 'Synthetic review-notes guidance.',
+      source: 'workspace', enabled: true, userInvocable: true }];
+    const list = vi.spyOn(runtime, 'listSkills').mockImplementation(async () => catalog);
+    const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
     const screen = render(<TerminalApp controller={app} />);
     const send = async (text: string) => { screen.stdin.write(text); await settle(); screen.stdin.write('\r'); await settle(); };
     try {
@@ -609,17 +628,19 @@ describe('A08 terminal continuity', () => {
       await send('/skills list');
       expect(screen.lastFrame()).toContain('review-notes');
       expect(screen.lastFrame()).toContain('Synthetic review-notes');
-      const oldHash = app.listSkills().skills.find(skill => skill.name === 'review-notes')!.hash;
-      skillFile(f.workspace, 'review-notes', 'Updated guidance.');
-      skillFile(f.workspace, 'summarize-notes', 'New guidance.');
+      expect((await app.listSkills()).skills).toEqual(catalog);
+      catalog = [
+        { name: 'review-notes', description: 'Updated guidance.', source: 'workspace', enabled: true, userInvocable: true },
+        { name: 'summarize-notes', description: 'New guidance.', source: 'workspace', enabled: true, userInvocable: true },
+      ];
       await send('/skills reload');
       expect(screen.lastFrame()).toContain('summarize-notes');
-      expect(app.listSkills().skills.find(skill => skill.name === 'review-notes')!.hash).not.toBe(oldHash);
-      writeFileSync(file, 'Malformed skill.');
+      expect((await app.listSkills()).skills.find(skill => skill.name === 'review-notes')!.description).toBe('Updated guidance.');
+      list.mockRejectedValueOnce(new Error('SDK rejected malformed frontmatter.'));
       await send('/skills reload');
       expect(screen.lastFrame()).toContain('Skills command failed');
       expect(screen.lastFrame()).toContain('frontmatter');
-      expect(app.listSkills().skills).toHaveLength(5);
+      expect((await app.listSkills()).skills).toEqual(catalog);
       await send('/skills unknown');
       expect(screen.lastFrame()).toContain('Use /skills list or /skills reload.');
       await send('/skills');
@@ -629,7 +650,8 @@ describe('A08 terminal continuity', () => {
   it('retains safe paste, live request inspection/approval, plans, results and resize-safe scrolling', async () => {
     const f = fixture();
     const runtime = new ScriptRuntime(async runtime => {
-      await runtime.call('workspace_read', { path: 'notes.txt' });
+      await runtime.requestPermission('read_file', { path: 'notes.txt' });
+      await runtime.call('work_inspect', {});
       runtime.message('Synthetic terminal evidence.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
@@ -643,7 +665,7 @@ describe('A08 terminal continuity', () => {
       screen.stdin.write('\r'); await settle();
       expect(screen.lastFrame()).toContain('APPROVAL REQUIRED');
       await send('/request');
-      expect(screen.lastFrame()).toContain('workspace_read');
+      expect(screen.lastFrame()).toContain('read_file');
       await send('/approve');
       expect(app.inspect().objective?.status).toBe('completed');
       expect(screen.lastFrame()).toContain('Synthetic terminal evidence.');

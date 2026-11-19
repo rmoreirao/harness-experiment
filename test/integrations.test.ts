@@ -1,36 +1,40 @@
 import { z } from 'zod';
 import { describe, it, expect, vi } from 'vitest';
-import { SessionController } from '../src/controller.js';
+import { TrustedSessionController as SessionController } from './helpers.js';
 import { ProtectedNetwork } from '../src/network.js';
 import { parseConfig } from '../src/config.js';
 import { fixture, ScriptRuntime, approve } from './helpers.js';
-import { httpFixture } from './mcp-fixture.js';
+import { sdkFixture } from './sdk-fixture.js';
 
 describe('A01/A06 integration trust and A07 paid tool admission', () => {
   it.each(['https://example.com', '*'])('does not turn an allowed public-read origin into automatic query/export approval (%s)', async allowed => {
     const f = fixture({ network: { origins: [allowed] } });
     let effects = 0; let decisions = 0;
     const runtime = new ScriptRuntime(async runtime => {
+      await runtime.requestPermission('fixture_fetch', { url: 'https://example.com/document' }, 'retrieval');
       await runtime.call('fixture_fetch', { url: 'https://example.com/document' });
-      await expect(runtime.call('fixture_fetch', { url: 'https://example.com/collect?data=synthetic' })).rejects.toThrow('denied');
+      await expect(runtime.requestPermission('fixture_fetch', { url: 'https://example.com/collect?data=synthetic' }, 'export')).rejects.toThrow('denied');
       runtime.message('The query/export action was denied; only the scoped retrieval executed.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
     app.broker.register('fixture_fetch', 'Synthetic protected-origin policy fixture.', z.object({ url: z.string().url() }).strict(),
       'network', () => { effects++; return { synthetic: true }; }, args => ({ origins: [new URL(String(args.url)).origin] }));
-    app.broker.grant([], ['https://example.com'], Date.now() + 60000);
-    app.subscribe(event => { if (event.type === 'request') decisions++; }); approve(app, 'deny');
+    app.subscribe(event => {
+      if (event.type !== 'request') return;
+      const request = app.inspect().pending.at(-1)!;
+      app.decide(request.id, request.revision, request.binding, ++decisions === 1 ? 'approve' : 'deny');
+    });
     try {
-      expect((await app.submit('Exercise the exact synthetic read/export boundary.')).status).toBe('partial');
-      expect(effects).toBe(1); expect(decisions).toBe(1);
+      expect((await app.submit('Exercise the exact synthetic read/export boundary.')).output).toContain('query/export action was denied');
+      expect(effects).toBe(1); expect(decisions).toBe(2);
     } finally { await app.close(); f.cleanup(); }
   });
 
-  it('keeps tool approvals and exact trusted-read grants separate from wildcard reachability', async () => {
+  it('keeps SDK tool approvals separate from wildcard reachability', async () => {
     const f = fixture({ network: { origins: ['*'] } });
     let effects = 0; let decisions = 0;
     const runtime = new ScriptRuntime(async runtime => {
-      await expect(runtime.call('fixture_fetch', { url: 'https://example.com/document' })).rejects.toThrow('denied');
+      await expect(runtime.requestPermission('fixture_fetch', { url: 'https://example.com/document' })).rejects.toThrow('denied');
       runtime.message('Wildcard reachability did not authorize the action.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
@@ -38,50 +42,46 @@ describe('A01/A06 integration trust and A07 paid tool admission', () => {
       'network', () => { effects++; return { synthetic: true }; }, args => ({ origins: [new URL(String(args.url)).origin] }));
     app.subscribe(event => { if (event.type === 'request') decisions++; }); approve(app, 'deny');
     try {
-      expect(() => app.broker.grant([], ['*'], Date.now() + 60000)).toThrow('exact');
-      expect((await app.submit('Exercise explicit authorization under wildcard reachability.')).status).toBe('partial');
-      expect(effects).toBe(0); expect(decisions).toBe(1); expect(app.inspect().grants).toHaveLength(0);
+      expect((await app.submit('Exercise explicit authorization under wildcard reachability.')).output).toContain('did not authorize');
+      expect(effects).toBe(0); expect(decisions).toBe(1); expect(app.inspect().pending).toHaveLength(0);
     } finally { await app.close(); f.cleanup(); }
   });
 
-  it('approves exact no-auth MCP calls through the broker and denies calls without connecting or executing', async () => {
-    const http = await httpFixture(); const origin = new URL(http.url).origin;
-    const f = fixture({ network: { localFixtureOrigins: [origin] }, mcp: [{ name: 'fixture', url: http.url, tools: ['echo'], trusted: true }] });
-    const runtime = new ScriptRuntime(async runtime => {
-      await runtime.call('mcp_fixture_echo', { arguments: { text: 'Synthetic MCP evidence.' } });
-      runtime.message('The exact approved no-auth call returned its result.');
-    });
-    let app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime }); approve(app, 'deny');
+  it('passes configured native MCP transports to the SDK without custom no-auth wrappers', async () => {
+    const f = await sdkFixture({ mcpServers: {
+      fixture: { type: 'http', url: 'https://mcp.example.invalid/tools', tools: ['echo'] },
+      local: { type: 'stdio', command: 'node', args: ['fixture.js'] },
+    } });
     try {
-      await app.submit('Deny the synthetic MCP action.'); expect(http.calls()).toBe(0);
-      await app.close();
-      app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime }); approve(app);
-      const result = await app.submit('Approve the synthetic MCP action.');
-      expect(result.status, result.reason ?? '').toBe('completed'); expect(http.calls()).toBe(1);
-      expect(app.inspect().actions.find(action => action.tool === 'mcp_fixture_echo')?.status).toBe('completed');
-    } finally { await app.close(); http.server.closeAllConnections(); await new Promise<void>(resolve => http.server.close(() => resolve())); f.cleanup(); }
+      expect(f.configuration().mcpServers).toEqual({
+        fixture: { type: 'http', url: 'https://mcp.example.invalid/tools', tools: ['echo'] },
+        local: { type: 'stdio', command: 'node', args: ['fixture.js'] },
+      });
+      expect(f.configuration().tools?.some(tool => tool.name.startsWith('mcp_'))).toBe(false);
+      expect(f.configuration().onMcpAuthRequest).toBeTypeOf('function');
+    } finally { await f.cleanup(); }
   });
-  it('enforces dispatch concurrency and revokes queued trusted reads before effects', async () => {
+  it('enforces dispatch concurrency and cancels queued reads before effects', async () => {
     const f = fixture({ limits: { concurrency: 1 } });
     let active = 0; let maximum = 0;
     let release!: () => void;
     const blocked = new Promise<void>(resolve => { release = resolve; });
     let entered!: () => void; const firstEntered = new Promise<void>(resolve => { entered = resolve; });
+    const queued = new AbortController();
     const runtime = new ScriptRuntime(async runtime => {
       const first = runtime.call('fixture_read', { number: 1 });
       await firstEntered;
-      const second = runtime.call('fixture_read', { number: 2 });
-      app.broker.revoke(grant); release();
-      await first; await expect(second).rejects.toThrow('revoked');
-      runtime.message('The occupied slot completed; the queued revoked read did not execute.');
+      const second = app.broker.dispatch('fixture_read', { number: 2 }, 'queued-read', queued.signal);
+      queued.abort(new Error('Queued read cancelled.')); release();
+      await first; await expect(second).rejects.toThrow('Queued read cancelled');
+      runtime.message('The occupied slot completed; the cancelled queued read did not execute.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
-    const grant = app.broker.grant([f.workspace], [], Date.now() + 60000);
     app.broker.register('fixture_read', 'Synthetic bounded concurrency fixture.', z.object({ number: z.number() }).strict(), 'read',
       async args => { active++; maximum = Math.max(maximum, active); entered(); await blocked; active--; return args; },
       () => ({ paths: ['notes.txt'] }));
     try {
-      expect((await app.submit('Exercise real dispatch admission.')).status).toBe('partial');
+      expect((await app.submit('Exercise real dispatch admission.')).status).toBe('completed');
       expect(maximum).toBe(1);
       expect(app.inspect().actions.filter(action => action.status === 'completed')).toHaveLength(1);
     } finally { await app.close(); f.cleanup(); }
@@ -121,7 +121,7 @@ describe('A01/A06 integration trust and A07 paid tool admission', () => {
   });
   it.each([true, false])('reconciles model billing without losing priced searches or inventing unknown tool charges (priced: %s)', async priced => {
     const f = fixture({
-      version: 3, network: { origins: ['https://api.search.brave.com'] },
+      version: 4, network: { origins: ['https://api.search.brave.com'] },
       search: { provider: 'brave', ...(priced ? { costPerRequest: 0.02 } : {}) },
       limits: { ...(priced ? { maxCost: 1 } : { maxTokens: 100000 }), inputPerMillion: 2, outputPerMillion: 3 },
     });

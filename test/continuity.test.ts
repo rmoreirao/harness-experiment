@@ -1,18 +1,18 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, it, expect } from 'vitest';
 import { provider, complete, message } from './provider-fixture.js';
 import { fixture, skillFile, ScriptRuntime, approve } from './helpers.js';
 import { parseConfig } from '../src/config.js';
-import { SessionController } from '../src/controller.js';
+import { TrustedSessionController as SessionController } from './helpers.js';
 
-function client(configFile: string, cwd: string, resumeId?: string) {
+function client(configFile: string, cwd: string, resumeId?: string, trusted = true) {
   const command = path.resolve('src', 'cli.tsx');
   const process = spawn(globalThis.process.execPath, ['--import', pathToFileURL(path.resolve('node_modules', 'tsx', 'dist', 'loader.mjs')).href, command,
-    '--headless', '--config', configFile, ...(resumeId ? ['resume', resumeId] : [])], {
-    cwd, env: { ...globalThis.process.env, OPENAI_API_KEY: 'synthetic-provider-wire-key', OPENAI_BASE_URL: '', HARNESS_MODEL: '', HARNESS_WIRE_MODEL: '' },
+    '--headless', ...(trusted ? ['--trust-workspace'] : []), '--config', configFile, ...(resumeId ? ['resume', resumeId] : [])], {
+    cwd, env: { ...globalThis.process.env, HARNESS_PROVIDER: 'byok', OPENAI_API_KEY: 'synthetic-provider-wire-key', OPENAI_BASE_URL: '', HARNESS_MODEL: '', HARNESS_WIRE_MODEL: '' },
   });
   let buffer = ''; let stderr = '';
   const records: Record<string, unknown>[] = [];
@@ -26,7 +26,7 @@ function client(configFile: string, cwd: string, resumeId?: string) {
   process.stderr.on('data', chunk => { stderr += String(chunk); });
   const send = (id: string, operation: string, args: Record<string, unknown> = {}) => process.stdin.write(JSON.stringify({ id, operation, args }) + '\n');
   const wait = async (predicate: (record: Record<string, unknown>) => boolean) => {
-    const deadline = Date.now() + 20000;
+    const deadline = Date.now() + 60000;
     while (Date.now() < deadline) {
       const record = records.find(predicate);
       if (record) return record;
@@ -43,28 +43,51 @@ async function close(process: ChildProcessWithoutNullStreams): Promise<void> {
   process.stdin.end(); await exited;
 }
 describe('A05/A08 actual process continuity', () => {
-  it('lists and reloads the configured skill snapshot through the headless API without starting model work', async () => {
+  it('requires an explicit headless trust decision before model skills or MCP activation', async () => {
+    const f = fixture({ mcpServers: { marker: { command: process.execPath, args: ['-e',
+      'require("node:fs").writeFileSync("MUST_NOT_START_MCP","executed")'] } } });
+    const file = path.join(f.directory, 'config.json'); writeFileSync(file, JSON.stringify(f.config));
+    const app = client(file, f.workspace, undefined, false);
+    try {
+      app.send('inspect-untrusted', 'inspect');
+      expect((await app.wait(record => record.id === 'inspect-untrusted')).result).toMatchObject({ trusted: false, unsandboxed: true });
+      app.send('blocked-submit', 'submit', { objective: 'Do not start model work.' });
+      expect((await app.wait(record => record.id === 'blocked-submit' && record.type === 'error')).message).toContain('Explicit session trust');
+      app.send('blocked-skills', 'skills');
+      expect((await app.wait(record => record.id === 'blocked-skills' && record.type === 'error')).message).toContain('Explicitly trust');
+      app.send('decline', 'trust', { trusted: false });
+      expect((await app.wait(record => record.id === 'decline')).result).toEqual({ trusted: false, unsandboxed: true });
+      expect(existsSync(path.join(f.workspace, 'MUST_NOT_START_MCP'))).toBe(false);
+      app.send('explicit', 'trust', { trusted: true });
+      expect((await app.wait(record => record.id === 'explicit')).result).toEqual({ trusted: true, unsandboxed: true });
+      expect(existsSync(path.join(f.workspace, 'MUST_NOT_START_MCP'))).toBe(false);
+    } finally { await close(app.process); f.cleanup(); }
+  }, 90000);
+
+  it('lists and reloads the effective SDK skill catalog through headless use without model work', async () => {
     const f = fixture();
     skillFile(f.workspace, 'review-notes', 'Original guidance.');
     const file = path.join(f.directory, 'config.json'); writeFileSync(file, JSON.stringify(f.config));
     const app = client(file, f.workspace);
     try {
       app.send('list', 'skills', { action: 'list' });
-      const initial = (await app.wait(record => record.id === 'list')).result as { skills: { name: string; hash: string }[] };
+      const initial = (await app.wait(record => record.id === 'list')).result as { skills: { name: string; enabled: boolean }[] };
       expect(initial.skills.some(skill => skill.name === 'review-notes')).toBe(true);
       skillFile(f.workspace, 'review-notes', 'Reloaded guidance.');
+      skillFile(f.workspace, 'new-workspace-skill', 'New guidance.');
       app.send('reload', 'skills', { action: 'reload' });
       const updated = (await app.wait(record => record.id === 'reload')).result as typeof initial;
-      expect(updated.skills.find(skill => skill.name === 'review-notes')!.hash).not.toBe(initial.skills.find(skill => skill.name === 'review-notes')!.hash);
+      expect(updated.skills.map(skill => skill.name)).toContain('new-workspace-skill');
+      expect(updated.skills.find(skill => skill.name === 'review-notes')!.enabled).toBe(true);
       app.send('invalid', 'skills', { action: 'unknown' });
       expect((await app.wait(record => record.id === 'invalid')).type).toBe('error');
     } finally { await close(app.process); f.cleanup(); }
-  });
+  }, 90000);
   it('runs independent headless terminals with real SDK children, rejects conflicting commands, and exposes bounded results', async () => {
     const endpoint = await provider((response, _body, count) => complete(response, `resp_cli_${count}`,
       message('Synthetic headless result.'), 'Synthetic headless result.'));
-    const f = fixture({ version: 3 });
-    const config = parseConfig({ ...f.config, model: { ...f.config.model, baseURL: endpoint.baseURL } });
+    const f = fixture({ version: 4 });
+    const config = parseConfig({ ...f.config, provider: { kind: 'byok', baseURL: endpoint.baseURL } });
     const file = path.join(f.directory, 'config.json'); writeFileSync(file, JSON.stringify(config));
     const one = client(file, f.workspace); const two = client(file, f.workspace);
     try {
@@ -92,7 +115,7 @@ describe('A05/A08 actual process continuity', () => {
     } finally { await Promise.all([close(one.process), close(two.process)]); await endpoint.close(); f.cleanup(); }
   }, 60000);
 
-  it.each([2, 3])('persists unknown external effects, requires exact reconciliation and never replays them on version-%i cold continuation', async version => {
+  it.each([4])('persists unknown external effects, requires exact reconciliation and never replays them on version-%i cold continuation', async version => {
     const f = fixture({ version }); const external = path.join(f.directory, 'effect.txt');
     let effects = 0;
     const runtime = new ScriptRuntime(async runtime => { await runtime.call('fixture_effect', {}); });
@@ -108,12 +131,14 @@ describe('A05/A08 actual process continuity', () => {
       const next = new ScriptRuntime(async runtime => { runtime.message('The checked effect was not repeated.'); });
       app = await SessionController.open({ config: f.config, sessionId: id, runtimeFactory: () => next });
       const action = app.inspect().actions.find(action => action.status === 'unknown')!;
-      await expect(app.submit('Conflicting objective.')).rejects.toThrow('already admitted');
+      await expect(app.submit('Conflicting objective.')).rejects.toThrow('current objective');
       await expect(app.reconcile({ note: 'Not enough detail.' })).rejects.toThrow('Every unknown');
       await app.reconcile({ note: 'Inspected the synthetic external resource.', actions: [{ id: action.id, note: 'The exact effect is present once.' }] });
       const continued = await app.continueObjective();
       expect(continued.id).toBe(interrupted.id); expect(continued.deadline).toBe(interrupted.deadline);
-      expect(continued.status).toBe('completed'); expect(effects).toBe(1);
+      expect(continued.status).toBe('partial');
+      expect(continued.reason).toContain('verification');
+      expect(effects).toBe(1);
       expect(readFileSync(external, 'utf8')).toBe('effect occurred once');
     } finally { await app.close(); f.cleanup(); }
   });

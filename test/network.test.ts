@@ -5,6 +5,17 @@ import { Store } from '../src/store.js';
 import { fixture } from './helpers.js';
 
 describe('Wildcard public-network policy', () => {
+  it('defaults citation retrieval to wildcard outbound access without a per-site allowlist', async () => {
+    const f = fixture();
+    try {
+      expect(f.config.network.origins).toEqual(['*']);
+      expect(allowsHttpsOrigin(f.config.network.origins, 'https://www.globo.com')).toBe(true);
+      expect(allowsHttpsOrigin(f.config.network.origins, 'https://g1.globo.com')).toBe(true);
+      expect(await new ProtectedNetwork(f.config).destination('https://8.8.8.8/document'))
+        .toMatchObject({ address: '8.8.8.8', family: 4 });
+    } finally { f.cleanup(); }
+  });
+
   it('admits arbitrary public HTTPS origins without enumerating each site', async () => {
     const f = fixture({ network: { origins: ['*'] } });
     const network = new ProtectedNetwork(f.config);
@@ -33,8 +44,8 @@ describe('Wildcard public-network policy', () => {
     } finally { f.cleanup(); }
   });
 
-  it('preserves deny-by-default/exact-origin modes and requires literal fixture scopes', async () => {
-    const f = fixture();
+  it('preserves explicitly restricted origins and requires literal fixture scopes', async () => {
+    const f = fixture({ network: { origins: [] } });
     try {
       await expect(new ProtectedNetwork(f.config).destination('https://8.8.8.8')).rejects.toThrow('not configured');
       const exact = parseConfig({ ...f.config, network: { origins: ['https://8.8.8.8'] } });
@@ -45,21 +56,22 @@ describe('Wildcard public-network policy', () => {
     } finally { f.cleanup(); }
   });
 
-  it('permits explicitly configured HTTPS search/MCP connectors without removing their trust/URL restrictions', () => {
+  it('keeps protected search restrictions separate from SDK-native MCP configuration', () => {
     const f = fixture({ network: { origins: ['*'] } });
     try {
       expect(parseConfig({ ...f.config, search: { provider: 'brave' },
-        mcp: [{ name: 'selected', url: 'https://service.example/mcp', tools: ['lookup'], trusted: true }],
+        mcpServers: { selected: { type: 'http', url: 'https://service.example/mcp', tools: ['lookup'] } },
       }).search?.provider).toBe('brave');
-      for (const url of ['http://service.example/mcp', 'https://user:password@service.example/mcp', 'https://service.example/mcp?token=private']) {
-        expect(() => parseConfig({ ...f.config, mcp: [{ name: 'selected', url, tools: ['lookup'], trusted: true }] }), url).toThrow();
+      expect(() => parseConfig({ ...f.config, network: { origins: [] }, search: { provider: 'brave' } })).toThrow('allowed HTTPS');
+      for (const url of ['https://user:password@service.example/mcp', 'https://service.example/mcp?token=private', 'file:///outside']) {
+        expect(() => parseConfig({ ...f.config, mcpServers: { selected: { type: 'http', url, tools: ['lookup'] } } }), url).toThrow();
       }
-      expect(() => parseConfig({ ...f.config, mcp: [{ name: 'selected', url: 'https://service.example/mcp', tools: ['lookup'], trusted: false }] })).toThrow();
+      expect(() => parseConfig({ ...f.config, mcp: [{ name: 'selected', url: 'https://service.example/mcp', trusted: true }] })).toThrow('Unrecognized key');
     } finally { f.cleanup(); }
   });
 
   it('persists wildcard sessions without broadening previously saved session configurations', () => {
-    const f = fixture();
+    const f = fixture({ network: { origins: [] } });
     let store = new Store(f.dataDir);
     try {
       const old = store.createSession(f.config);

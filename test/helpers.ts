@@ -4,8 +4,14 @@ import { tmpdir } from 'node:os';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_SKILLS_DIRECTORY, parseConfig } from '../src/config.js';
-import { SessionController } from '../src/controller.js';
-import type { Runtime, RuntimeOptions } from '../src/contracts.js';
+import { SessionController, type OpenOptions } from '../src/controller.js';
+import { HarnessError, type PermissionMode, type Runtime, type RuntimeOptions, type TaskMode } from '../src/contracts.js';
+import type { SkillInfo } from '../src/skills.js';
+
+export const TrustedSessionController = {
+  open: (options: OpenOptions): Promise<SessionController> => SessionController.open({ ...options, trusted: true }),
+};
+export type TrustedSessionController = SessionController;
 
 export function fixture(overrides: Record<string, unknown> = {}) {
   const directory = mkdtempSync(path.join(tmpdir(), 'harness-test-'));
@@ -13,8 +19,9 @@ export function fixture(overrides: Record<string, unknown> = {}) {
   const dataDir = path.join(directory, 'state');
   writeFileSync(path.join(workspace, 'notes.txt'), 'Synthetic reference evidence.\nValue: 2\n');
   const config = parseConfig({
-    version: 2, workspace, dataDir,
-    model: { baseURL: 'http://127.0.0.1:9/v1', canonical: 'gpt-6.1-sol', wire: 'synthetic-deployment' },
+    version: 4, workspace, dataDir,
+    provider: { kind: 'byok', baseURL: 'http://127.0.0.1:9/v1', apiKeyEnv: 'OPENAI_API_KEY' },
+    model: { canonical: 'gpt-6.1-sol', wire: 'synthetic-deployment' },
     ...overrides,
   });
   return { directory, workspace, dataDir, config,
@@ -40,11 +47,30 @@ export class ScriptRuntime implements Runtime {
     return JSON.parse(result.text) as Record<string, unknown>;
   }
   message(text: string): void { this.options?.emit('text', { message: text }); }
+  async requestPermission(name: string, args: Record<string, string | number | boolean | null> = {}, callId = 'synthetic-permission'): Promise<void> {
+    const result = await this.options!.permission({
+      kind: 'custom-tool', toolName: name, toolDescription: 'Synthetic SDK permission request.', toolCallId: callId, args,
+    }, { sessionId: this.options!.sessionId });
+    const decision = result.kind === 'attributed' ? result.result : result;
+    if (decision.kind !== 'approve-once') throw new HarnessError('TOOL_DENIED', 'SDK permission was denied.');
+  }
   async updatePlan(content: string): Promise<void> { this.plan = content; }
   async readPlan(): Promise<string | null> { return this.plan || null; }
   async events(): Promise<unknown[]> { return []; }
   async abort(): Promise<void> {}
   async close(): Promise<void> {}
+  async setPermissionMode(mode: PermissionMode): Promise<PermissionMode> {
+    if (this.options) this.options.permissionMode = mode;
+    return mode;
+  }
+  async setTaskMode(mode: TaskMode): Promise<void> { if (this.options) this.options.taskMode = mode; }
+  async auth(_action: 'status' | 'login' | 'advance' | 'cancel', _input?: string): Promise<Record<string, unknown>> {
+    return { status: 'unavailable', reason: 'Synthetic runtime has no live account.' };
+  }
+  async mcp(_action: 'list' | 'status' | 'login', _serverName?: string): Promise<Record<string, unknown>> {
+    return { status: 'unavailable', reason: 'Synthetic runtime has no live MCP connections.' };
+  }
+  async listSkills(): Promise<SkillInfo[]> { return []; }
 }
 export function approve(app: SessionController, answer = 'approve'): () => void {
   return app.subscribe(event => {

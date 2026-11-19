@@ -53,7 +53,7 @@ export class DockerExecution {
     const baseline = Object.fromEntries(new Workspace(this.config).mirror(directory));
     const mirror = new Workspace(this.config, directory);
     mirror.resolve(cwd);
-    const container = `harness-v2-${id}`;
+    const container = `harness-native-${id}`;
     const record: ExecutionRecord = {
       id, sessionId: this.sessionId, objectiveId, directory, baseline, container, executable, args,
       status: 'running', exitCode: null, outputResultId: null,

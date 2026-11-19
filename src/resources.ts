@@ -26,10 +26,20 @@ export class Semaphore {
 }
 export class Resources {
   readonly tools: Semaphore;
-  readonly models = new Semaphore(1);
+  readonly models: Semaphore;
+  readonly workers: Semaphore;
   constructor(readonly store: Store, readonly config: Config, readonly sessionId: string,
     private readonly objectiveId: () => string, private readonly scope: 'objective' | 'verification' = 'objective') {
     this.tools = new Semaphore(config.limits.concurrency);
+    this.models = new Semaphore(config.limits.modelConcurrency);
+    this.workers = new Semaphore(config.limits.workerConcurrency);
+  }
+  rates(model = this.config.model.canonical): { input: number; output: number } | null {
+    if (this.config.provider.kind !== 'byok') return null;
+    const entry = this.config.models.find(item => item.id === model);
+    const input = entry?.inputPerMillion ?? (model === this.config.model.canonical ? this.config.limits.inputPerMillion : undefined);
+    const output = entry?.outputPerMillion ?? (model === this.config.model.canonical ? this.config.limits.outputPerMillion : undefined);
+    return input === undefined || output === undefined ? null : { input, output };
   }
   current(): Objective { return this.store.get('objective', this.objectiveId(), this.sessionId); }
   get hasBudget(): boolean { return this.config.limits.maxTokens !== undefined || this.config.limits.maxCost !== undefined; }
@@ -52,7 +62,7 @@ export class Resources {
     objective.actions++; this.store.put('objective', objective);
   }
   beginModelRequest(bodyBytes: number, interaction: string, input?: { frameHash: string; items: readonly unknown[] },
-    outputLimit?: number | null): ModelRequest {
+    outputLimit?: number | null, metadata: Pick<ModelRequest, 'provider' | 'model' | 'wireModel' | 'actorId'> = {}): ModelRequest {
     const objective = this.check();
     const limits = this.config.limits;
     if (!Number.isSafeInteger(bodyBytes) || bodyBytes < 0) throw new HarnessError('MODEL_BODY', 'Invalid model request byte count.');
@@ -85,7 +95,9 @@ export class Resources {
       throw new HarnessError('TOKEN_LIMIT', `Insufficient tokens: ${used}/${limits.maxTokens} used; next reservation ${reservation}, remaining ${available}. No model request was sent.`);
     }
     if (limits.maxCost !== undefined) {
-      const maximumPrice = Math.max(limits.inputPerMillion!, limits.outputPerMillion!);
+      const prices = [this.rates(), ...this.config.models.map(item => this.rates(item.id))];
+      if (prices.some(price => price === null)) throw new HarnessError('COST_LIMIT', 'Every configured model needs pricing for an enforceable currency budget.');
+      const maximumPrice = Math.max(...prices.flatMap(price => price ? [price.input, price.output] : []));
       if ((objective.usage.cost ?? 0) + (objective.usage.reserved + reservation) * maximumPrice / 1e6 > limits.maxCost) {
         throw new HarnessError('COST_LIMIT', 'Insufficient currency to reserve the model request.');
       }
@@ -96,6 +108,8 @@ export class Resources {
       requestBytes: bodyBytes, ...(this.hasBudget ? { inputBound, inputFingerprint: fingerprint } : {}),
       budgetScope: this.hasBudget ? this.scope : 'none',
       started: Date.now(), outcome: 'running',
+      provider: this.config.provider.kind, model: this.config.model.canonical, wireModel: this.config.model.wire,
+      ...metadata,
     };
     this.store.db.transaction(() => {
       objective.usage.reserved += reservation; objective.usage.requests++;
@@ -120,11 +134,9 @@ export class Resources {
     if (valid) {
       request.input = usage.input; request.output = usage.output;
       objective.usage.input += usage.input; objective.usage.output += usage.output;
-      const limits = this.config.limits;
-      if (limits.inputPerMillion !== undefined && objective.usage.cost !== null) {
-        objective.usage.cost +=
-          (usage.input * limits.inputPerMillion + usage.output * limits.outputPerMillion!) / 1e6;
-      }
+      const rates = this.rates(request.model);
+      if (rates && objective.usage.cost !== null) objective.usage.cost += (usage.input * rates.input + usage.output * rates.output) / 1e6;
+      else objective.usage.cost = null;
       if (request.status === 'completed' && request.reservation > 0 && usage.input + usage.output > request.reservation) objective.usage.unknown = true;
     } else if (!knownNoCharge) { objective.usage.unknown = true; objective.usage.cost = null; }
     this.store.db.transaction(() => { this.store.put('model', request); this.store.put('objective', objective); })();

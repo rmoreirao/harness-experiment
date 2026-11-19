@@ -1,4 +1,7 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import Database from 'better-sqlite3';
 import { Store } from '../src/store.js';
 import { Ownership } from '../src/ownership.js';
 import { fixture, worker } from './helpers.js';
@@ -23,7 +26,83 @@ it('rejects a newer database schema rather than downgrading it', () => {
   const f = fixture(); cleanup.push(f.cleanup);
   const store = new Store(f.config.dataDir);
   store.db.pragma('user_version = 3'); store.close();
-  expect(() => new Store(f.config.dataDir)).toThrow('Unsupported schema');
+  expect(() => new Store(f.config.dataDir)).toThrow('Unsupported session storage generation');
+});
+
+describe('Native storage generation', () => {
+  it('uses a fresh native store without modifying historical data', () => {
+    const f = fixture(); cleanup.push(f.cleanup);
+    const historical = path.join(f.directory, 'historical.db');
+    const old = new Database(historical);
+    old.exec('CREATE TABLE legacy_records(value TEXT); INSERT INTO legacy_records VALUES (\'historical sentinel\'); PRAGMA user_version=2;');
+    old.close();
+    const before = readFileSync(historical);
+    const store = new Store(f.dataDir);
+    try {
+      expect(store.db.pragma('user_version', { simple: true })).toBe(4);
+      expect(existsSync(path.join(f.dataDir, 'native.db'))).toBe(true);
+      expect(existsSync(path.join(f.dataDir, 'product-v2.db'))).toBe(false);
+      const session = store.createSession(f.config);
+      expect(store.session(session.id)).toMatchObject({
+        id: session.id, runtimeId: session.runtimeId, config: { version: 4, provider: { kind: 'byok' } },
+      });
+      expect(readFileSync(historical)).toEqual(before);
+    } finally { store.close(); }
+  });
+
+  it('rejects historical stores without upgrading or adding files', () => {
+    const f = fixture(); cleanup.push(f.cleanup);
+    const created = new Store(f.dataDir); created.close();
+    const historical = path.join(f.dataDir, 'product-v2.db');
+    const old = new Database(historical);
+    old.exec('CREATE TABLE sessions(value TEXT); INSERT INTO sessions VALUES (\'untouched session\'); PRAGMA user_version=2;');
+    old.close();
+    writeFileSync(path.join(f.dataDir, 'user-note.txt'), 'Preserve historical data.');
+    const names = readdirSync(f.dataDir).sort();
+    const before = new Map(names.map(name => [name, readFileSync(path.join(f.dataDir, name))]));
+    expect(() => new Store(f.dataDir)).toThrow('Historical session storage is unsupported');
+    expect(readdirSync(f.dataDir).sort()).toEqual(names);
+    for (const [name, bytes] of before) expect(readFileSync(path.join(f.dataDir, name)), name).toEqual(bytes);
+  });
+
+  it('rejects unknown native storage generations without changing their schema', () => {
+    const f = fixture(); cleanup.push(f.cleanup);
+    const store = new Store(f.dataDir);
+    store.db.pragma('user_version = 99'); store.close();
+    const file = path.join(f.dataDir, 'native.db');
+    const before = readFileSync(file);
+    expect(() => new Store(f.dataDir)).toThrow('Use a fresh native data directory');
+    expect(readFileSync(file)).toEqual(before);
+    const inspect = new Database(file, { readonly: true });
+    try { expect(inspect.pragma('user_version', { simple: true })).toBe(99); }
+    finally { inspect.close(); }
+  });
+
+  it('retains worker delegation and native invocation identity across reopen', () => {
+    const f = fixture(); cleanup.push(f.cleanup);
+    let store = new Store(f.dataDir);
+    try {
+      const id = store.createSession(f.config).id;
+      store.put('worker', { id: 'worker-one', sessionId: id, objectiveId: 'objective-one',
+        parentId: 'parent-agent', name: 'writer', model: 'worker-model', callId: 'delegation-one',
+        status: 'completed', started: 100, finished: 200 });
+      store.put('action', { id: 'native-one', sessionId: id, objectiveId: 'objective-one',
+        runtimeSessionId: 'child-sdk-session', actorId: 'worker-one', parentCallId: 'delegation-one',
+        callId: 'native-call-one', tool: 'powershell', origin: 'native', effect: 'execute', args: { command: 'Synthetic check.' },
+        argsHash: 'synthetic-hash', status: 'completed', resultId: null, error: null });
+      store.close(); store = new Store(f.dataDir);
+      expect(store.get('worker', 'worker-one', id)).toEqual({
+        id: 'worker-one', sessionId: id, objectiveId: 'objective-one', parentId: 'parent-agent',
+        name: 'writer', model: 'worker-model', callId: 'delegation-one', status: 'completed', started: 100, finished: 200,
+      });
+      expect(store.get('action', 'native-one', id)).toMatchObject({
+        runtimeSessionId: 'child-sdk-session', actorId: 'worker-one', parentCallId: 'delegation-one',
+        callId: 'native-call-one', origin: 'native', status: 'completed',
+      });
+      expect(store.get('action', 'native-one', id)).not.toHaveProperty('container');
+      expect(() => store.get('action', 'native-one', 'another-session')).toThrow('belongs to this session');
+    } finally { store.close(); }
+  });
 });
 it('preserves redacted structured errors across reopen and restricts inspection to the owning session', () => {
   const f = fixture(); cleanup.push(f.cleanup);

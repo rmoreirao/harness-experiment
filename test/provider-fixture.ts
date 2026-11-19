@@ -46,10 +46,42 @@ export async function provider(handler: (res: ServerResponse, body: Record<strin
     } catch (error) {
       res.writeHead(500).end(String(error));
     }
+
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('No provider fixture port');
   return { requests, baseURL: `http://127.0.0.1:${address.port}/v1`,
     close: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); } };
+}
+
+// Feed the real SDK's controlled model transport without binding a port or
+// contacting a provider. Responses use the same synchronous SSE fixture above.
+export function memoryProvider(handler: (res: ServerResponse, body: Record<string, unknown>, count: number) => void) {
+  const requests: Record<string, unknown>[] = [];
+  const baseURL = 'http://127.0.0.1:9/v1';
+  let closed = false;
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (closed || request.url !== `${baseURL}/responses` || request.method !== 'POST' ||
+        request.headers.get('authorization') !== `Bearer ${providerKey}`) {
+      throw new Error('Unexpected in-memory provider destination or authorization; no network request was sent.');
+    }
+    const body: unknown = JSON.parse(await request.text());
+    if (!record(body)) throw new Error('Invalid in-memory model request.');
+    requests.push(body);
+    let status = 200;
+    let headers: Record<string, string> = {};
+    let ended = false;
+    const chunks: string[] = [];
+    const response = {
+      writeHead(code: number, values: Record<string, string>) { status = code; headers = values; return response; },
+      write(chunk: string) { chunks.push(chunk); return true; },
+      end(chunk?: string) { if (chunk !== undefined) chunks.push(chunk); ended = true; return response; },
+    };
+    handler(response as unknown as ServerResponse, body, requests.length);
+    if (!ended) throw new Error('In-memory provider fixtures must complete synchronously.');
+    return new Response(chunks.join(''), { status, headers });
+  };
+  return { requests, baseURL, fetch, close: async () => { closed = true; } };
 }

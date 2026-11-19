@@ -45,7 +45,7 @@ export function projectActivity(item: ActivityRecord, context: ActivityContext):
   }
   return {
     id: value.id, shortId: `${item.kind === 'tool' ? 't' : 'm'}-${value.id.slice(0, 8)}`,
-    kind: item.kind, name: item.kind === 'tool' ? item.value.tool : context.model.canonical,
+    kind: item.kind, name: item.kind === 'tool' ? item.value.tool : item.value.model ?? context.model.canonical,
     status, successful, started: value.started, finished: value.finished, detail: item,
   };
 }
@@ -83,7 +83,8 @@ export function activityLine(item: Activity | ActivityGroup, now = Date.now()): 
   const action = item.detail.kind === 'tool' ? item.detail.value : undefined;
   const target = action && typeof action.args.path === 'string' ? ` ${action.args.path.slice(0, 120)}` : '';
   const usage = item.detail.kind === 'model' && item.status === 'completed' && !item.successful ? ' | usage unknown' : '';
-  return terminalText(`[${label}] ${item.kind.toUpperCase()} ${item.shortId} ${item.name}${target} | ${elapsed(item, now)}${usage}`);
+  const actor = item.detail.value.actorId ? ` | worker ${item.detail.value.actorId.slice(0, 12)}` : '';
+  return terminalText(`[${label}] ${item.kind.toUpperCase()} ${item.shortId} ${item.name}${target} | ${elapsed(item, now)}${actor}${usage}`);
 }
 
 export function activityDetail(item: Activity, config: Config): string {
@@ -93,20 +94,25 @@ export function activityDetail(item: Activity, config: Config): string {
     `ID: ${item.id}`, `Status: ${item.status}`, `Duration: ${elapsed(item, Date.now())}`,
     `Started: ${item.started === undefined ? 'unavailable' : new Date(item.started).toISOString()}`,
     `Finished: ${item.finished === undefined ? 'unavailable' : new Date(item.finished).toISOString()}`,
-    'Task association: unavailable',
+    `Actor: ${record.value.actorId ?? 'parent'}`,
   ];
   if (record.kind === 'tool') {
     const action = record.value;
     const args = JSON.stringify(action.args, null, 2);
-    lines.push(`Runtime call ID: ${action.callId}`, `Effect: ${action.effect}`,
+    lines.push(`Runtime call ID: ${action.callId}`, `Runtime session: ${action.runtimeSessionId ?? 'parent'}`,
+      `Origin: ${action.origin ?? 'custom'}`, `Effect: ${action.effect}`,
       `Arguments (redacted):\n${args.slice(0, 8192)}${args.length > 8192 ? '\n[arguments truncated]' : ''}`,
       `Result: ${action.resultId ? `/inspect ${action.resultId}` : 'unavailable'}`);
   } else {
     const request = record.value;
     const reported = request.reportedUsage ?? request.status === 'completed';
-    const price = reported && config.limits.inputPerMillion !== undefined && config.limits.outputPerMillion !== undefined
-      ? (request.input * config.limits.inputPerMillion + request.output * config.limits.outputPerMillion) / 1e6 : null;
-    lines.push(`Wire model: ${config.model.wire}`,
+    const model = request.model ?? config.model.canonical;
+    const entry = config.models.find(item => item.id === model);
+    const inputRate = entry?.inputPerMillion ?? (model === config.model.canonical ? config.limits.inputPerMillion : undefined);
+    const outputRate = entry?.outputPerMillion ?? (model === config.model.canonical ? config.limits.outputPerMillion : undefined);
+    const price = reported && config.provider.kind === 'byok' && inputRate !== undefined && outputRate !== undefined
+      ? (request.input * inputRate + request.output * outputRate) / 1e6 : null;
+    lines.push(`Provider: ${request.provider ?? config.provider.kind}`, `Model: ${model}`, `Wire model: ${request.wireModel ?? config.model.wire}`,
       `Interaction: ${request.interaction === 'model-or-auxiliary' ? 'unavailable' : request.interaction}`,
       `Input tokens: ${reported ? request.input : 'unknown'}`, `Output tokens: ${reported ? request.output : 'unknown'}`,
       `Cost: ${price === null ? 'unknown' : `${price} (configured pricing)`}`,

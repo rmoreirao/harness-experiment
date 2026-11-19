@@ -3,8 +3,9 @@ import { createServer } from 'node:http';
 import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { SessionController } from '../src/controller.js';
+import { TrustedSessionController as SessionController } from './helpers.js';
 import { digest } from '../src/workspace.js';
+import { Workspace } from '../src/workspace.js';
 import { fixture, ScriptRuntime, approve } from './helpers.js';
 import type { ExecutionRecord } from '../src/contracts.js';
 
@@ -43,8 +44,9 @@ describe('Opt-in local provider acceptance (no downloads or paid calls)', () => 
       const baseline = await runtime.call('execution_run', { executable: '/bin/sh', args: ['check.sh'] }) as unknown as ExecutionRecord;
       expect(baseline.exitCode).toBe(1);
       expect(app.store.readResult(app.id, baseline.outputResultId!).text).toContain('FAIL: arithmetic mismatch');
-      const source = await runtime.call('workspace_read', { path: 'calculator.sh' });
-      await runtime.call('workspace_patch', { path: 'calculator.sh', expectedHash: source.hash, edits: [{ oldText: '$1-$2', newText: '$1+$2' }] });
+      const workspace = new Workspace(f.config);
+      const source = workspace.read('calculator.sh');
+      workspace.patch('calculator.sh', source.hash, [{ oldText: '$1-$2', newText: '$1+$2' }]);
       const check = await runtime.call('execution_run', { executable: '/bin/sh', args: ['check.sh'] }) as unknown as ExecutionRecord;
       expect(check.status, check.outputResultId ? app.store.readResult(app.id, check.outputResultId).text : JSON.stringify(check)).toBe('completed'); expect(check.exitCode).toBe(0);
       const isolation = await runtime.call('execution_run', { executable: '/bin/sh', args: ['-c',
@@ -57,9 +59,9 @@ describe('Opt-in local provider acceptance (no downloads or paid calls)', () => 
       await expect(runtime.call('execution_publish', { id: isolation.id, changes: publish })).rejects.toThrow('Host changed');
       expect(existsSync(path.join(f.workspace, 'approved.txt'))).toBe(false);
       await runtime.call('execution_publish', { id: isolation.id, changes: publish.filter(change => change.path === 'approved.txt') });
-      await runtime.call('git_inspect', { operation: 'diff' });
+      expect(execFileSync('git', ['--no-pager', 'diff', '--', 'calculator.sh'], { cwd: f.workspace, encoding: 'utf8' })).toContain('$1+$2');
       const checkResult = app.inspect().results.find(result => result.provenance.kind === 'process_output' && result.provenance.executionId === check.id)!;
-      await runtime.call('work_plan', { steps: [{ id: 'fix', title: 'Fix and verify arithmetic', expected: 'A genuine passing test and reviewed diff', status: 'done', results: [checkResult.id] }] });
+      await runtime.updatePlan(`Arithmetic verified by Docker result ${checkResult.id}; reviewed exact calculator diff.`);
       runtime.message('The focused change passes the real isolated check; unrelated changes are preserved.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime }); approve(app);
@@ -92,8 +94,12 @@ describe('Opt-in local provider acceptance (no downloads or paid calls)', () => 
       const typed = await runtime.call('browser_action', { observation: initial.id, selector: '#name', action: 'type', text: 'Synthetic' });
       const submit = { observation: typed.id, selector: '#submit', action: 'click',
         requests: [{ url: origin + '/done', method: 'POST', bodyHash: digest('name=Synthetic') }] };
-      await expect(runtime.call('browser_action', submit)).rejects.toThrow('denied');
+      await expect((async () => {
+        await runtime.requestPermission('browser_action', { selector: '#submit' });
+        return runtime.call('browser_action', submit);
+      })()).rejects.toThrow('denied');
       expect(submissions).toBe(0); denySubmission = false;
+      await runtime.requestPermission('browser_action', { selector: '#submit' });
       const done = await runtime.call('browser_action', submit);
       expect(submissions).toBe(1);
       expect(submittedCookie).toContain('synthetic=first');
@@ -104,22 +110,21 @@ describe('Opt-in local provider acceptance (no downloads or paid calls)', () => 
       const verified = await runtime.call('browser_verify', { observation: observation.id });
       expect(verified.verified).toBe(true);
       const evidence = app.inspect().results.find(result => result.provenance.tool === 'browser_verify')!;
-      await runtime.call('work_plan', { steps: [{ id: 'form', title: 'Complete synthetic form', expected: 'Observe saved state', status: 'done', results: [evidence.id] }] });
+      await runtime.updatePlan(`Saved form state verified by observation result ${evidence.id}.`);
       expect(done.snapshot).toContain('Saved synthetic request'); runtime.message('Saved synthetic request, verified from the page.');
     });
     const app = await SessionController.open({ config: f.config, runtimeFactory: () => runtime });
     app.subscribe(event => {
       if (event.type !== 'request') return;
       const request = app.inspect().pending.at(-1)!;
-      app.decide(request.id, request.revision, request.binding, denySubmission && request.description.includes('"selector":"#submit"') ? 'deny' : 'approve');
+      app.decide(request.id, request.revision, request.binding, denySubmission && request.description.includes('#submit') ? 'deny' : 'approve');
     });
     const secondRuntime = new ScriptRuntime(async runtime => {
       const state = await runtime.call('browser_navigate', { url: origin + '/state' });
       expect(state.snapshot).toContain('Cookie: none');
       await runtime.call('browser_verify', { observation: state.id });
       const evidence = second!.inspect().results.find(result => result.provenance.tool === 'browser_verify')!;
-      await runtime.call('work_plan', { steps: [{ id: 'isolation', title: 'Inspect independent browser state', expected: 'Observe no inherited cookies',
-        status: 'done', results: [evidence.id] }] });
+      await runtime.updatePlan(`Independent browser state verified by result ${evidence.id}.`);
       runtime.message('Independent browser state confirmed.');
     });
     let second: SessionController | undefined;

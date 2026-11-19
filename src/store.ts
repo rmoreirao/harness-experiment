@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, lstatSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, lstatSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { Redactor } from './privacy.js';
 import { hash } from './config.js';
@@ -15,16 +15,19 @@ export interface SessionRecord { id: string; runtimeId: string; config: Config; 
 export class Store {
   readonly db: Database.Database;
   constructor(readonly directory: string, readonly redactor = new Redactor()) {
+    if (existsSync(path.join(directory, 'product-v2.db'))) {
+      throw new HarnessError('COMPATIBILITY', 'Historical session storage is unsupported. Choose a fresh native data directory; old data was not modified.');
+    }
     mkdirSync(directory, { recursive: true });
     if (lstatSync(directory).isSymbolicLink()) throw new HarnessError('STORAGE', 'Application storage cannot be a symlink.');
-    this.db = new Database(path.join(directory, 'product-v2.db'));
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = FULL');
-    this.db.pragma('foreign_keys = ON');
+    this.db = new Database(path.join(directory, 'native.db'));
     try {
+      const version = this.db.pragma('user_version', { simple: true });
+      if (version !== 0 && version !== 4) throw new HarnessError('SCHEMA', 'Unsupported session storage generation. Use a fresh native data directory.');
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('synchronous = FULL');
+      this.db.pragma('foreign_keys = ON');
       this.db.transaction(() => {
-        const version = this.db.pragma('user_version', { simple: true });
-        if (version !== 0 && version !== 2) throw new HarnessError('SCHEMA', 'Unsupported schema version.');
         this.db.exec(`
           CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, runtime_id TEXT NOT NULL UNIQUE,
             config TEXT NOT NULL, digest TEXT NOT NULL, sdk TEXT NOT NULL, runtime TEXT NOT NULL, created INTEGER NOT NULL);
@@ -35,7 +38,7 @@ export class Store {
             AND status IN ('preparing','running','awaiting_approval','awaiting_input','recovery_required');
           CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,
             objective_id TEXT,type TEXT NOT NULL,at INTEGER NOT NULL,data TEXT NOT NULL);
-          PRAGMA user_version=2;
+          PRAGMA user_version=4;
         `);
       }).immediate();
     } catch (error) { this.db.close(); throw error; }
